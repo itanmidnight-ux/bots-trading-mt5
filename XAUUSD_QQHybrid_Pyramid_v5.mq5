@@ -807,32 +807,9 @@ void ManageOpenTrades()
       double curTP     = PositionGetDouble(POSITION_TP);
       double volume    = PositionGetDouble(POSITION_VOLUME);
       bool   isBuy     = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
-      datetime tOpen   = (datetime)PositionGetInteger(POSITION_TIME);
       totalPnL += profit; count++;
 
-      // 1. CIERRE POR TIEMPO QQ-STYLE
-      // Solo cierra si está en pérdida o sin ganancia; trades positivos protegidos por trailing
-      int barsOpen = (int)((TimeCurrent() - tOpen) / PeriodSeconds(PERIOD_CURRENT));
-      if(barsOpen >= InpMaxBarsOpen)
-      {
-         bool inProfit = (profit > 0);
-         // Si está en pérdida → cierre inmediato
-         if(!inProfit)
-         { trade.PositionClose(tk); Print("⏱️ Cierre tiempo+pérdida [", barsOpen, "barras] PnL:", profit); continue; }
-         // Si está en ganancia pero el mercado revierte (ATR corto supera ATR largo × 1.3)
-         // → cierre protector para no devolver lo ganado
-         if(inProfit && atr_cached > 0 && atrs_cached > 0)
-         {
-            bool reversalSignal = (atrs_cached > atr_cached * 1.3);
-            double pctMove      = profit / MathAbs(AccountInfoDouble(ACCOUNT_BALANCE) * InpRiskPercent / 100.0);
-            // Cierra si hay señal de reversión fuerte Y el trade lleva demasiado tiempo
-            if(reversalSignal && barsOpen >= (int)(InpMaxBarsOpen * 1.5))
-            { trade.PositionClose(tk); Print("⏱️ Cierre reversión ATR [", barsOpen, "barras] PnL:", profit); continue; }
-         }
-         // Trade positivo sin señal de reversión → dejar actuar trailing, no tocar
-      }
-
-      // 2. ★ CIERRE PARCIAL MEJORADO (BUG FIX: usa g_entry1Volume original)
+      // ★ CIERRE PARCIAL MEJORADO (BUG FIX: usa g_entry1Volume original)
       if(InpPartialClose && tk == oldestTk && g_entry1Volume > 0)
       {
          double curBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
@@ -886,45 +863,47 @@ void ManageOpenTrades()
 }
 
 //====================================================================
-//  TRAILING STOP ATR DINÁMICO v5
-//  – Se activa desde 0.25 ATR de ganancia
-//  – Se ajusta progresivamente: más ganancia → trailing más ajustado
+//  TRAILING STOP ATR – QUANTUM QUEEN STYLE
+//  Reglas exactas de QQ:
+//  1. Activo desde la primera barra (no requiere ganancia previa)
+//  2. El SL SOLO se mueve en dirección favorable, NUNCA retrocede
+//  3. Se ajusta progresivamente: más ganancia = trailing más corto
+//  4. La regla "solo avanza" reemplaza cualquier cap manual de BE
 //====================================================================
 void ApplyTrailingATR(ulong ticket, bool isBuy, double atr)
 {
    if(!PositionSelectByTicket(ticket)) return;
-   double curSL   = PositionGetDouble(POSITION_SL);
-   double curTP   = PositionGetDouble(POSITION_TP);
-   double curP    = PositionGetDouble(POSITION_PRICE_CURRENT);
-   double openP   = PositionGetDouble(POSITION_PRICE_OPEN);
+   double curSL = PositionGetDouble(POSITION_SL);
+   double curTP = PositionGetDouble(POSITION_TP);
+   double curP  = PositionGetDouble(POSITION_PRICE_CURRENT);
+   double openP = PositionGetDouble(POSITION_PRICE_OPEN);
    if(atr <= 0) return;
 
-   // Ganancia en precio desde apertura
+   // Distancia favorable desde apertura (negativo = en pérdida, no importa)
    double gainDist = isBuy ? (curP - openP) : (openP - curP);
 
-   // Solo activar trailing si hay ganancia real (≥ 0.25 ATR)
-   if(gainDist < atr * 0.25) return;
-
-   // Trailing dinámico: más ganancia → distancia más corta para proteger más
-   double mult = InpTrailingATRMult;
-   if     (gainDist >= atr * 2.0) mult = InpTrailingATRMult * 0.50; // ≥ 2R: muy ajustado
-   else if(gainDist >= atr * 1.2) mult = InpTrailingATRMult * 0.65; // ≥ 1.2R: ajustado
-   else if(gainDist >= atr * 0.7) mult = InpTrailingATRMult * 0.80; // ≥ 0.7R: moderado
+   // Multiplicador progresivo: cuanto mayor la ganancia, más ajustado el trailing
+   double mult;
+   if     (gainDist >= atr * 2.0) mult = 0.40; // ≥ 2 ATR ganancia: trail muy ajustado
+   else if(gainDist >= atr * 1.2) mult = 0.55; // ≥ 1.2 ATR: trail ajustado
+   else if(gainDist >= atr * 0.5) mult = InpTrailingATRMult * 0.80;
+   else                           mult = InpTrailingATRMult; // Posición inicial o en contra
 
    double trailD = atr * mult;
 
    if(isBuy)
    {
       double newSL = curP - trailD;
-      // El trailing nunca baja del BE si ya fue activado
-      if(g_beMoved && newSL < openP + _Point) newSL = openP + _Point;
-      if(newSL > curSL + _Point) trade.PositionModify(ticket, newSL, curTP);
+      // Regla QQ: el SL solo avanza hacia arriba, nunca retrocede
+      if(curSL > 0 && newSL <= curSL) return;
+      trade.PositionModify(ticket, newSL, curTP);
    }
    else
    {
       double newSL = curP + trailD;
-      if(g_beMoved && newSL > openP - _Point) newSL = openP - _Point;
-      if(newSL < curSL - _Point || curSL == 0) trade.PositionModify(ticket, newSL, curTP);
+      // Para SELL: el SL solo avanza hacia abajo (valores menores = mejor)
+      if(curSL > 0 && newSL >= curSL) return;
+      trade.PositionModify(ticket, newSL, curTP);
    }
 }
 
