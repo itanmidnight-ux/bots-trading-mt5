@@ -147,6 +147,12 @@ const string gTFNames[NUM_TFS] = {
 #define MAX_GRID_LAYERS 3
 #define MAX_OPEN_POS 50
 
+// ── Capital floors & confidence thresholds ──────────────────────────────
+#define MIN_CAPITAL_USD      9.50   // Hard floor live: refuse to operate below
+#define CONF_THRESH_MICRO   70.0   // Scoring gate: GROWTH + CAP_MICRO
+#define CONF_THRESH_SMALL   62.0   // Scoring gate: GROWTH + CAP_SMALL/MEDIUM
+#define CONF_THRESH_STD     50.0   // Scoring gate: STANDARD mode
+
 //====================================================================
 //  INDICATOR HANDLES — 8 TFs, set completo por TF principal
 //====================================================================
@@ -187,6 +193,22 @@ bool g_posTrackDirty = true;
 
 // Throttle ManagePositions en tester — solo nuevo bar M1
 datetime g_managePosLastBar = 0;
+
+//====================================================================
+//  PROBABILISTIC REGIME SCORING
+//====================================================================
+struct RegimeScoreData
+{
+   double trending, ranging, volatile_, momentum;
+   double confidence;   // 0-100 del régimen dominante
+};
+RegimeScoreData g_regScore;
+
+// Signal confidence per strategy (updated by CalcSignalConfidence)
+double g_stratConfidence[NUM_STRATS];
+
+// Equity peak por sesión — para compounding adaptativo
+double g_equityPeakSession = 0.0;
 
 //====================================================================
 //  REGIME STATE
@@ -306,6 +328,18 @@ int OnInit()
    g_isTesting = (bool)MQLInfoInteger(MQL_TESTER);
    g_paused    = InpStartPaused;
 
+   // ── Hard capital floor (solo en live — tester permite cualquier balance) ──
+   if(!g_isTesting)
+   {
+      double initBal = AccountInfoDouble(ACCOUNT_BALANCE);
+      if(initBal < MIN_CAPITAL_USD)
+      {
+         Alert(StringFormat("Capital insuficiente: $%.2f < $%.2f mínimo requerido. EA no iniciará.",
+               initBal, MIN_CAPITAL_USD));
+         return INIT_FAILED;
+      }
+   }
+
    // Modo inicial basado en balance de inicio (sin histéresis — evita quedarse en GROWTH con $500)
    g_opMode = (AccountInfoDouble(ACCOUNT_BALANCE) >= 500.0) ? OPMODE_STANDARD : OPMODE_GROWTH;
    Print("[OpMode] Inicial: ", g_opMode == OPMODE_STANDARD ? "STANDARD" : "GROWTH",
@@ -354,10 +388,13 @@ int OnInit()
       "Asian Range", "Mean Reversion BB", "Structure Break H1", "PDH/PDL Breakout",
       "Momentum M15", "Compression Break", "H1 Continuation", "Volume Impulse"
    };
+   // Todas las estrategias operan con gate M1 — el análisis usa datos
+   // cacheados de TFs superiores (M5, H1, D1) pero la entrada se confirma
+   // en cierre de vela M1, igual que el QQ real.
    ENUM_TIMEFRAMES entryTFs[NUM_STRATS] = {
-      PERIOD_M5,  PERIOD_H1, PERIOD_M5,  PERIOD_M5,
-      PERIOD_M5,  PERIOD_M5, PERIOD_H1,  PERIOD_M15,
-      PERIOD_M15, PERIOD_M15,PERIOD_H1,  PERIOD_M6
+      PERIOD_M1, PERIOD_M1, PERIOD_M1, PERIOD_M1,
+      PERIOD_M1, PERIOD_M1, PERIOD_M1, PERIOD_M1,
+      PERIOD_M1, PERIOD_M1, PERIOD_M1, PERIOD_M1
    };
    // Grid stacking solo en estrategias trend-continuation
    // (replican el "trend-following grid" del QQ real, añaden capa
@@ -416,6 +453,10 @@ int OnInit()
    g_dayStartBal        = AccountInfoDouble(ACCOUNT_BALANCE);
    g_peakBalance        = g_dayStartBal;
    g_sessionStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   g_equityPeakSession  = AccountInfoDouble(ACCOUNT_EQUITY);
+   for(int s=0; s<NUM_STRATS; s++) g_stratConfidence[s] = 0.0;
+   g_regScore.trending = 0; g_regScore.ranging = 0;
+   g_regScore.volatile_= 0; g_regScore.momentum= 0; g_regScore.confidence = 0;
    ApplyBrokerSet();
    DetectCapitalMode();
    DailyReset();
@@ -454,6 +495,16 @@ void OnDeinit(const int reason)
 void OnTick()
 {
    if(g_paused) { if(InpShowPanel) DrawPanel(); return; }
+
+   // Capital floor — suspende operaciones si balance cae bajo mínimo (live only)
+   if(!g_isTesting && AccountInfoDouble(ACCOUNT_BALANCE) < MIN_CAPITAL_USD)
+   {
+      Comment(StringFormat("EA SUSPENDIDA: capital $%.2f < mínimo $%.2f requerido",
+              AccountInfoDouble(ACCOUNT_BALANCE), MIN_CAPITAL_USD));
+      if(InpShowPanel) DrawPanel();
+      return;
+   }
+
    if(IsHolidayTime() && InpHolidayOff)
    {
       if(InpShowPanel) DrawPanel();
@@ -667,7 +718,9 @@ int TFIdx(ENUM_TIMEFRAMES tf)
 }
 
 //====================================================================
-//  ============= LAYER 1 — REGIME DETECTOR =============
+//  ============= LAYER 1 — REGIME DETECTOR (PROBABILISTIC) =============
+//  Scoring multicriterio 0-100 por régimen; evita clasificaciones binarias
+//  bruscas — más estable para microcapitales y mercado real.
 //====================================================================
 void UpdateRegime()
 {
@@ -675,9 +728,8 @@ void UpdateRegime()
    int iM5  = TFIdx(PERIOD_M5);
    int iH1  = TFIdx(PERIOD_H1);
    int iD1  = TFIdx(PERIOD_D1);
-   int iM15 = TFIdx(PERIOD_M15);
-   if(iM5<0 || iH1<0 || iD1<0 || !g_tf[iM5].valid || !g_tf[iH1].valid || !g_tf[iD1].valid)
-      return;
+   if(iM5<0 || iH1<0 || iD1<0 ||
+      !g_tf[iM5].valid || !g_tf[iH1].valid || !g_tf[iD1].valid) return;
 
    // Bias D1/H1
    g_d1TrendUp = (g_tf[iD1].ema50 > g_tf[iD1].ema200);
@@ -685,23 +737,87 @@ void UpdateRegime()
    g_h1TrendUp = (g_tf[iH1].ema50 > g_tf[iH1].ema200) && (g_tf[iH1].rsi > 50);
    g_h1TrendDn = (g_tf[iH1].ema50 < g_tf[iH1].ema200) && (g_tf[iH1].rsi < 50);
 
-   // Componentes régimen
-   bool adxStrong   = (g_adxH1 > 25.0);
-   bool adxWeak     = (g_adxH1 < 18.0);
-   bool bbNarrow    = (g_bbWidthAvgM5 > 0 && g_tf[iM5].bbWidth < g_bbWidthAvgM5 * 0.70);
-   bool atrSpike    = (g_atrAvgM5 > 0 && g_tf[iM5].atr > g_atrAvgM5 * 1.50);
-   bool emaAligned  = (g_tf[iH1].ema9 > g_tf[iH1].ema21 && g_tf[iH1].ema21 > g_tf[iH1].ema50) ||
-                      (g_tf[iH1].ema9 < g_tf[iH1].ema21 && g_tf[iH1].ema21 < g_tf[iH1].ema50);
-   bool fastMomentum = (g_adxM15 > 28.0) && atrSpike;
+   // ── Pre-calcular indicadores booleanos ────────────────────────────
+   bool emaAlignUp = (g_tf[iH1].ema9  > g_tf[iH1].ema21 &&
+                      g_tf[iH1].ema21 > g_tf[iH1].ema50);
+   bool emaAlignDn = (g_tf[iH1].ema9  < g_tf[iH1].ema21 &&
+                      g_tf[iH1].ema21 < g_tf[iH1].ema50);
+   bool m5EmaUp    = (g_tf[iM5].ema9  > g_tf[iM5].ema21 &&
+                      g_tf[iM5].ema21 > g_tf[iM5].ema50);
+   bool m5EmaDn    = (g_tf[iM5].ema9  < g_tf[iM5].ema21 &&
+                      g_tf[iM5].ema21 < g_tf[iM5].ema50);
+   bool bbNarrow   = (g_bbWidthAvgM5>0 && g_tf[iM5].bbWidth < g_bbWidthAvgM5*0.70);
+   bool bbWide     = (g_bbWidthAvgM5>0 && g_tf[iM5].bbWidth > g_bbWidthAvgM5*1.35);
+   bool atrSpike   = (g_atrAvgM5>0    && g_tf[iM5].atr      > g_atrAvgM5*1.50);
+   bool atrLow     = (g_atrAvgM5>0    && g_tf[iM5].atr      < g_atrAvgM5*0.75);
 
+   // ── Scoring por régimen (puntos acumulativos) ─────────────────────
+   double sTrend=0, sRange=0, sVol=0, sMom=0;
+
+   // ADX H1 — máx 35 pts trending / 30 pts ranging
+   if     (g_adxH1 > 32)  sTrend += 35;
+   else if(g_adxH1 > 25)  sTrend += 25;
+   else if(g_adxH1 > 20)  sTrend += 12;
+   if     (g_adxH1 < 14)  sRange += 30;
+   else if(g_adxH1 < 18)  sRange += 20;
+   else if(g_adxH1 < 22)  sRange +=  8;
+
+   // Alineación EMA H1 — máx 20 pts trending / 8 pts ranging
+   if(emaAlignUp || emaAlignDn) sTrend += 20;
+   else                         sRange +=  8;
+
+   // Alineación EMA M5 — máx 10 pts trending
+   if(m5EmaUp || m5EmaDn) sTrend += 10;
+
+   // Cross-TF alignment bonus (H1+M5 alineados = tendencia fuerte)
+   if((emaAlignUp && m5EmaUp) || (emaAlignDn && m5EmaDn)) sTrend += 8;
+
+   // Bollinger Bands width — máx 22 pts ranging / 12 pts volatile
+   if(bbNarrow)  sRange += 22;
+   if(bbWide)  { sVol   += 12; sMom  +=  5; }
+
+   // ATR vs media — máx 20 pts volatile+momentum / 10 pts ranging
+   if(atrSpike){ sVol   += 20; sMom  +=  8; }
+   if(atrLow)    sRange += 10;
+
+   // ADX M15 para momentum rápido — máx 15 pts
+   if     (g_adxM15 > 35)  { sMom += 15; sVol +=  8; }
+   else if(g_adxM15 > 28)  { sMom +=  8; }
+   else if(g_adxM15 < 18)    sRange +=  5;
+
+   // RSI extremos — indicador de momentum/exceso
+   double rsiH1 = g_tf[iH1].rsi, rsiM5 = g_tf[iM5].rsi;
+   if(rsiH1>72 || rsiH1<28 || rsiM5>75 || rsiM5<25) { sMom += 8; sVol += 5; }
+
+   // D1 bias suma a tendencia
+   if(g_d1TrendUp || g_d1TrendDn) sTrend += 10;
+
+   // ── Normalización 0-100 (máximos teóricos: Trend~113, Range~73, Vol~45, Mom~44) ──
+   g_regScore.trending  = MathMin(100.0, sTrend / 113.0 * 100.0);
+   g_regScore.ranging   = MathMin(100.0, sRange /  73.0 * 100.0);
+   g_regScore.volatile_ = MathMin(100.0, sVol   /  45.0 * 100.0);
+   g_regScore.momentum  = MathMin(100.0, sMom   /  44.0 * 100.0);
+
+   // ── Clasificación con umbrales conservadores ──────────────────────
    ENUM_REGIME newReg = REG_NEUTRAL;
-   if(fastMomentum)                       newReg = REG_MOMENTUM;
-   else if(atrSpike)                      newReg = REG_VOLATILE;
-   else if(adxStrong && emaAligned)       newReg = REG_TRENDING;
-   else if(adxWeak && bbNarrow)           newReg = REG_RANGING;
-   else if(adxStrong)                     newReg = REG_TRENDING;
-   else if(bbNarrow)                      newReg = REG_RANGING;
-   else                                   newReg = REG_NEUTRAL;
+   double conf = 0;
+
+   if(sMom >= 18 && atrSpike && g_adxM15 > 28)
+      { newReg = REG_MOMENTUM; conf = g_regScore.momentum; }
+   else if(sVol >= 18 && atrSpike)
+      { newReg = REG_VOLATILE; conf = g_regScore.volatile_; }
+   else if(sTrend >= 30 && (emaAlignUp || emaAlignDn))
+      { newReg = REG_TRENDING; conf = g_regScore.trending; }
+   else if(sRange >= 22 && bbNarrow)
+      { newReg = REG_RANGING;  conf = g_regScore.ranging;  }
+   else if(sTrend > sRange && sTrend >= 18)
+      { newReg = REG_TRENDING; conf = g_regScore.trending; }
+   else if(sRange >= sTrend && sRange >= 18)
+      { newReg = REG_RANGING;  conf = g_regScore.ranging;  }
+   else
+      { newReg = REG_NEUTRAL;  conf = 0; }
+
+   g_regScore.confidence = conf;
 
    if(newReg != g_regime)
    {
@@ -721,6 +837,71 @@ string RegimeStr()
       case REG_MOMENTUM: return "MOMENTUM";
    }
    return "NEUTRAL";
+}
+
+//====================================================================
+//  SIGNAL CONFIDENCE SCORING — 0-100 por estrategia y dirección
+//  Combina: regime score + H1 direction + D1 alignment + ADX + ATR
+//====================================================================
+double CalcSignalConfidence(int sId, bool isBuy)
+{
+   double score = 0;
+   int iH1 = TFIdx(PERIOD_H1);
+   int iM5 = TFIdx(PERIOD_M5);
+
+   // Regime confidence (0-30 pts)
+   score += g_regScore.confidence * 0.30;
+
+   // H1 direction alignment (0-25 pts)
+   if     (isBuy  && g_h1TrendUp)                         score += 25;
+   else if(!isBuy && g_h1TrendDn)                         score += 25;
+   else if(!(isBuy && g_h1TrendDn) && !(!isBuy && g_h1TrendUp)) score +=  8;  // neutral H1
+
+   // D1 alignment (0-15 pts)
+   if(isBuy  && g_d1TrendUp) score += 15;
+   if(!isBuy && g_d1TrendDn) score += 15;
+
+   // ADX H1 strength (0-15 pts)
+   if     (g_adxH1 > 30) score += 15;
+   else if(g_adxH1 > 25) score += 10;
+   else if(g_adxH1 > 20) score +=  5;
+
+   // ATR en rango saludable vs media (0-10 pts / penalización -8)
+   if(iM5 >= 0 && g_tf[iM5].valid && g_atrAvgM5 > 0)
+   {
+      double ar = g_tf[iM5].atr / g_atrAvgM5;
+      if     (ar >= 0.75 && ar <= 1.60) score += 10;
+      else if(ar < 0.40  || ar > 2.50)  score -=  8;
+   }
+
+   // RSI H1 — penaliza extremos, premia zona saludable
+   if(iH1 >= 0 && g_tf[iH1].valid)
+   {
+      double rsi = g_tf[iH1].rsi;
+      if( isBuy && rsi > 72) score -= 10;
+      if(!isBuy && rsi < 28) score -= 10;
+      if( isBuy && rsi >  55 && rsi < 68) score += 5;
+      if(!isBuy && rsi >= 32 && rsi < 45) score += 5;
+   }
+
+   // Bonus de sesión para estrategias con gate horario
+   MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
+   int hm = dt.hour*60 + dt.min;
+   if(sId == 2 && dt.hour >= 8 && dt.hour < 11)         score += 5;  // S3 London
+   if(sId == 3 && hm >= 13*60+30 && hm < 17*60)         score += 5;  // S4 NY
+   if(sId == 7 && dt.hour >= 7  && dt.hour < 15)        score += 3;  // S8 PDH window
+
+   return MathMax(0.0, MathMin(100.0, score));
+}
+
+double ConfidenceThreshold()
+{
+   if(g_opMode == OPMODE_GROWTH)
+   {
+      if(g_capMode == CAP_MICRO) return CONF_THRESH_MICRO;
+      return CONF_THRESH_SMALL;
+   }
+   return CONF_THRESH_STD;
 }
 
 //====================================================================
@@ -788,6 +969,40 @@ void ActivateStrategies()
    // S12 Volume Impulse — MOMENTUM
    g_str[11].activeRegime = (r == REG_MOMENTUM
                              || (r == REG_VOLATILE && g_tf[TFIdx(PERIOD_M15)].mfi > 65));
+
+   // ── GROWTH Mode: whitelist estricta por nivel de capital ─────────────
+   // Reduce simultáneamente el número de estrategias activas para limitar
+   // exposición en cuentas pequeñas y forzar alta precisión de señales.
+   if(g_opMode == OPMODE_GROWTH)
+   {
+      bool allowed[NUM_STRATS];
+      for(int i=0; i<NUM_STRATS; i++) allowed[i] = false;
+
+      if(g_capMode == CAP_MICRO)
+      {
+         // <$50: solo 3 estrategias de máxima precisión con sesión controlada
+         allowed[0] = true;   // S1  Trend Follow M5
+         allowed[2] = true;   // S3  London ORB
+         allowed[3] = true;   // S4  NY Session
+      }
+      else if(g_capMode == CAP_SMALL)
+      {
+         // $50-$299: añadir Pullback H1, Structure Break y PDH/PDL
+         allowed[0] = true; allowed[1] = true; allowed[2] = true;
+         allowed[3] = true; allowed[6] = true; allowed[7] = true;
+         allowed[10]= true;   // S11 H1 Continuation
+      }
+      else
+      {
+         // $300-$499 aún en GROWTH: todas menos estrategias overnight/mean-rev
+         for(int i=0; i<NUM_STRATS; i++) allowed[i] = true;
+         allowed[4] = false;   // S5 Asian Range: riesgo nocturno
+         allowed[5] = false;   // S6 Mean Reversion: DD potencial en tendencia
+      }
+
+      for(int s=0; s<NUM_STRATS; s++)
+         if(!allowed[s]) g_str[s].activeRegime = false;
+   }
 
    // Set status display
    for(int s=0; s<NUM_STRATS; s++)
@@ -1088,6 +1303,12 @@ bool EnterOrStackPosition(int sId, bool isBuy)
 {
    if(g_str[sId].posCount == 0)
    {
+      // ── Confidence gate — filtra señales por calidad probabilística ──
+      double conf   = CalcSignalConfidence(sId, isBuy);
+      double thresh = ConfidenceThreshold();
+      g_stratConfidence[sId] = conf;
+      if(conf < thresh) return false;
+
       // Filtro calidad entrada — solo para posiciones base (no grid layers)
       if(!CheckEntryQuality(sId, isBuy)) return false;
       // Apertura base — usa RR y SL configurados en state struct
@@ -1615,45 +1836,76 @@ void ManagePositions()
       bool isLong = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
       double opPx = PositionGetDouble(POSITION_PRICE_OPEN);
       double slPx = PositionGetDouble(POSITION_SL);
+      double tpPx = PositionGetDouble(POSITION_TP);
       double curPx= isLong ? SymbolInfoDouble(_Symbol, SYMBOL_BID)
                            : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
       double slDist= MathAbs(opPx - slPx);
       if(slDist <= 0) continue;
       double rMove = isLong ? (curPx - opPx) / slDist : (opPx - curPx) / slDist;
 
-      // 1. Break-even at 0.8R
-      if(rMove >= 0.8)
+      // ── No gestionar posición en la misma vela M1 que se abrió ────
+      // Evita trailing prematuro y cierres en el mismo bar de entrada.
+      datetime posOpenTime = (datetime)PositionGetInteger(POSITION_TIME);
+      datetime curM1Bar    = iTime(_Symbol, PERIOD_M1, 0);
+      if(posOpenTime >= curM1Bar) continue;
+
+      // ── 1. Break-even adaptativo ──────────────────────────────────
+      // GROWTH MICRO: BE más temprano (0.6R) para proteger microganancias
+      double beTrigger = (g_opMode == OPMODE_GROWTH && g_capMode == CAP_MICRO) ? 0.60 : 0.80;
+      if(rMove >= beTrigger)
       {
          double newSL = isLong ? opPx + slDist*0.05 : opPx - slDist*0.05;
-         if(isLong  && (slPx < opPx || slPx == 0)) trade.PositionModify(t, newSL, PositionGetDouble(POSITION_TP));
-         if(!isLong && (slPx > opPx || slPx == 0)) trade.PositionModify(t, newSL, PositionGetDouble(POSITION_TP));
+         if(isLong  && (slPx < opPx || slPx == 0)) trade.PositionModify(t, newSL, tpPx);
+         if(!isLong && (slPx > opPx || slPx == 0)) trade.PositionModify(t, newSL, tpPx);
       }
 
-      // 2. Partial close 50% at 1R
+      // ── 2. Cierre parcial adaptativo ─────────────────────────────
       bool isGridLayer = StringFind(PositionGetString(POSITION_COMMENT), "-G") >= 0;
-      if(!isGridLayer && rMove >= 1.0 && !IsPartialDone(t, 1))
+      double partialTrigger = (g_opMode == OPMODE_GROWTH && g_capMode == CAP_MICRO) ? 0.80 : 1.00;
+      double partialPct     = (g_opMode == OPMODE_GROWTH && g_capMode == CAP_MICRO) ? 0.40 : 0.50;
+      if(!isGridLayer && rMove >= partialTrigger && !IsPartialDone(t, 1))
       {
-         double vol = PositionGetDouble(POSITION_VOLUME);
-         double half = NormalizeLot(vol * 0.50);
-         if(half > 0 && half < vol) { trade.PositionClosePartial(t, half); MarkPartial(t, 1); }
+         double vol  = PositionGetDouble(POSITION_VOLUME);
+         double part = NormalizeLot(vol * partialPct);
+         if(part > 0 && part < vol) { trade.PositionClosePartial(t, part); MarkPartial(t, 1); }
       }
 
-      // 3. Trailing ATR a partir de 1.2R (trend strategies)
-      bool isTrendStrat = (sId == 0 || sId == 1 || sId == 6 || sId == 10);
-      if(isTrendStrat && rMove >= 1.2)
+      // ── 3. Smart trailing — H1-aware, tiered por R ───────────────
+      if(rMove >= 1.0)
       {
-         int iM5 = TFIdx(PERIOD_M5);
-         double atr = g_tf[iM5].atr;
-         double newSL = isLong ? curPx - atr*1.5 : curPx + atr*1.5;
-         double curSL = PositionGetDouble(POSITION_SL);
-         if(isLong  && (newSL > curSL)) trade.PositionModify(t, newSL, PositionGetDouble(POSITION_TP));
-         if(!isLong && (newSL < curSL || curSL == 0)) trade.PositionModify(t, newSL, PositionGetDouble(POSITION_TP));
+         int iM5t = TFIdx(PERIOD_M5);
+         if(iM5t >= 0 && g_tf[iM5t].valid)
+         {
+            double atrT = g_tf[iM5t].atr;
+
+            // H1 direction determina holgura del trail
+            bool h1WithUs    = (isLong  && g_h1TrendUp) || (!isLong && g_h1TrendDn);
+            bool h1AgainstUs = (isLong  && g_h1TrendDn) || (!isLong && g_h1TrendUp);
+
+            double trailMult;
+            if     (h1WithUs)     trailMult = 1.80;  // H1 con nosotros: dejar correr
+            else if(h1AgainstUs)  trailMult = 0.90;  // H1 contra: trail ceñido
+            else                  trailMult = 1.30;  // H1 neutral
+
+            bool isTrendStrat = (sId==0||sId==1||sId==6||sId==10);
+            if(isTrendStrat)  trailMult *= 1.10;  // Trend strats: dar más espacio
+            if(rMove >= 2.0)  trailMult *= 0.70;  // Late stage: apretar siempre
+
+            // GROWTH MICRO: multiplier más conservador
+            if(g_opMode == OPMODE_GROWTH && g_capMode == CAP_MICRO)
+               trailMult *= 0.80;
+
+            double newSL = isLong ? curPx - atrT*trailMult : curPx + atrT*trailMult;
+            double curSL = PositionGetDouble(POSITION_SL);
+            if(isLong  && newSL > curSL)               trade.PositionModify(t, newSL, tpPx);
+            if(!isLong && (newSL < curSL || curSL==0)) trade.PositionModify(t, newSL, tpPx);
+         }
       }
 
-      // 4. Time-based exit (max barras según TF estrategia)
-      datetime oTime = (datetime)PositionGetInteger(POSITION_TIME);
-      int barsOpen = (int)((TimeCurrent() - oTime) / 60); // minutos
-      int maxMin = StratMaxMinutes(sId);
+      // ── 4. Time-based exit (max minutos según estrategia) ─────────
+      datetime oTime  = (datetime)PositionGetInteger(POSITION_TIME);
+      int barsOpen    = (int)((TimeCurrent() - oTime) / 60);
+      int maxMin      = StratMaxMinutes(sId);
       if(barsOpen > maxMin && rMove < 0.5)
       {
          trade.PositionClose(t);
@@ -1810,15 +2062,28 @@ void DetectCapitalMode()
       // 5% = $25 a $500 → permite capturar días buenos sin parar prematuramente.
       g_growthHarvestUSD = bal * 0.050;
 
-      // Compounding basado en wins REALIZADOS del día — no en equity flotante
+      // Compounding adaptativo: win streak + crecimiento de equity de sesión
       double winBonus = 0.0;
-      if(g_winsToday >= 4)      winBonus = 0.25;
-      else if(g_winsToday >= 3) winBonus = 0.18;
-      else if(g_winsToday >= 2) winBonus = 0.10;
-      else if(g_winsToday >= 1) winBonus = 0.05;
-      double losspenalty = g_lossesToday * 0.08;
-      g_growthCompound = MathMax(0.0, MathMin(0.25, winBonus - losspenalty));
-      g_riskPct       *= (1.0 + g_growthCompound);
+      if     (g_winsToday >= 5) winBonus = 0.20;
+      else if(g_winsToday >= 4) winBonus = 0.16;
+      else if(g_winsToday >= 3) winBonus = 0.12;
+      else if(g_winsToday >= 2) winBonus = 0.08;
+      else if(g_winsToday >= 1) winBonus = 0.04;
+
+      // Bonus por equity milestone: cada +2% de sesión agrega +1% (máx +10%)
+      double eqNow    = AccountInfoDouble(ACCOUNT_EQUITY);
+      if(eqNow > g_equityPeakSession) g_equityPeakSession = eqNow;
+      double sessRet  = (g_sessionStartEquity > 0)
+                        ? (eqNow - g_sessionStartEquity) / g_sessionStartEquity : 0.0;
+      double eqBonus  = MathMin(0.10, MathFloor(sessRet / 0.02) * 0.01);
+      // Reducir bonus si estamos en DD desde el pico de sesión
+      double fromPeak = (g_equityPeakSession > 0)
+                        ? (g_equityPeakSession - eqNow) / g_equityPeakSession : 0.0;
+      if(fromPeak > 0.02) eqBonus *= MathMax(0.0, 1.0 - fromPeak*8.0);
+
+      double lossPenalty = MathMin(g_lossesToday * 0.06, 0.18);
+      g_growthCompound   = MathMax(0.0, MathMin(0.25, winBonus + eqBonus - lossPenalty));
+      g_riskPct         *= (1.0 + g_growthCompound);
    }
    else
    {
@@ -2312,18 +2577,37 @@ void CheckPreNewsExit()
 bool IsNewsTime()
 {
    MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
-   int hm = dt.hour*60 + dt.min;
-   if(hm >= 13*60+25 && hm < 13*60+45) return true;
-   if(hm >= 18*60+55 && hm < 19*60+15) return true;
+   int hm  = dt.hour*60 + dt.min;
+   int dow = dt.day_of_week;
+
+   // ─ Ventanas fijas de alto impacto (hora GMT servidor) ────────────
+   if(hm >= 13*60+25 && hm < 13*60+48) return true;  // US CPI / FOMC / PPI
+   if(hm >= 14*60+55 && hm < 15*60+15) return true;  // US Retail / ISM / ADP
+   if(hm >= 18*60+55 && hm < 19*60+15) return true;  // Fed speakers / minutos FOMC
+
+   // ─ Pre-apertura americana (transición London→NY) ─────────────────
+   if(hm >= 13*60+15 && hm < 13*60+30) return true;
+
+   // ─ NFP: primer viernes de cada mes, 13:30 GMT ± 45 min ──────────
+   if(dow == 5 && dt.day <= 7 && hm >= 12*60+50 && hm < 14*60+20) return true;
+
    return false;
 }
 
 bool IsNewsTimeNear()
 {
    MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
-   int hm = dt.hour*60 + dt.min;
+   int hm  = dt.hour*60 + dt.min;
+   int dow = dt.day_of_week;
+
+   // Pre-news alerts (20 min antes de cada ventana)
    if(hm >= 13*60+5  && hm < 13*60+25) return true;
+   if(hm >= 14*60+35 && hm < 14*60+55) return true;
    if(hm >= 18*60+35 && hm < 18*60+55) return true;
+
+   // NFP pre-alert: 30 min antes
+   if(dow == 5 && dt.day <= 7 && hm >= 12*60+20 && hm < 12*60+50) return true;
+
    return false;
 }
 
@@ -2369,6 +2653,7 @@ void DailyReset()
    g_winsToday = 0; g_lossesToday = 0;
    g_dayInvalid = false;
    g_sessionStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   g_equityPeakSession  = g_sessionStartEquity;
    for(int s=0; s<NUM_STRATS; s++)
    {
       g_str[s].winsToday        = 0;
@@ -2497,6 +2782,44 @@ bool OpenTrade(int sId, bool isBuy, ENUM_TIMEFRAMES slTF, double slMult, double 
    if(g_tradesToday >= g_maxTradesDay) return false;
    if(CountAllOpen() >= g_maxConcurrent) return false;
    if(!FilterSpread()) return false;
+
+   // ── Exposure guard: limita lotes totales simultáneos por modo ────
+   {
+      double curExp  = TotalOpenVolume();
+      double minL    = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+      double maxExp;
+      if(g_opMode == OPMODE_GROWTH)
+      {
+         if     (g_capMode == CAP_MICRO)  maxExp = minL * 1.50;  // máx 1 micro-lot activo
+         else if(g_capMode == CAP_SMALL)  maxExp = minL * 3.00;
+         else                             maxExp = minL * 6.00;
+      }
+      else  // STANDARD
+      {
+         double bal = AccountInfoDouble(ACCOUNT_BALANCE);
+         maxExp = MathMax(minL * 10.0, bal * 0.002);  // 0.2% balance en lotes
+      }
+      if(curExp >= maxExp) return false;
+   }
+
+   // ── Correlación direccional: no abrir misma dirección si ya saturados ──
+   if(g_opMode == OPMODE_GROWTH)
+   {
+      int openDir = 0;
+      int total   = PositionsTotal();
+      for(int i=0; i<total; i++)
+      {
+         ulong tk = PositionGetTicket(i);
+         if(!PositionSelectByTicket(tk)) continue;
+         if(PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
+         if(StringFind(PositionGetString(POSITION_COMMENT), "-R") >= 0) continue;
+         bool posLong = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
+         if(posLong == isBuy) openDir++;
+      }
+      int maxDir = (g_capMode == CAP_MICRO) ? 1 : 2;
+      if(openDir >= maxDir) return false;
+   }
+
    int idx = TFIdx(slTF);
    if(idx < 0 || !g_tf[idx].valid) return false;
    double atr = g_tf[idx].atr;
@@ -2661,7 +2984,8 @@ void DrawPanel()
    PanelLabel(PNL_PREFIX+"L16", 16, y, StringFormat("Margin Stop: %.0f %%", moLvl), clrLightGray, InpPanelFontSize); y+=18;
    PanelLabel(PNL_PREFIX+"L17", 16, y, StringFormat("Total Volume: %.2f Lots", TotalOpenVolume()), clrLightGray, InpPanelFontSize); y+=22;
 
-   PanelLabel(PNL_PREFIX+"L18", 16, y, "Regime: "+RegimeStr(), RegimeColor(), InpPanelFontSize); y+=18;
+   PanelLabel(PNL_PREFIX+"L18", 16, y, StringFormat("Regime: %s [conf:%.0f%%]",
+             RegimeStr(), g_regScore.confidence), RegimeColor(), InpPanelFontSize); y+=18;
    // Operating mode — destacado con color diferencial + progreso de milestone
    string opModeLabel;
    if(g_opMode == OPMODE_GROWTH)
@@ -2692,10 +3016,12 @@ void DrawPanel()
    {
       string statTxt = StratStatusStr(s);
       color  statClr = StratStatusColor(s);
-      string line = StringFormat("[Strategy %2d] %-3s | %s",
+      string confStr = (g_str[s].activeRegime && g_stratConfidence[s] > 0)
+                       ? StringFormat(" c:%.0f", g_stratConfidence[s]) : "";
+      string line = StringFormat("[Strategy %2d] %-3s | %s%s",
                                  s+1,
                                  (g_str[s].activeRegime || g_str[s].posCount>0) ? "ON" : "OFF",
-                                 statTxt);
+                                 statTxt, confStr);
       string id = PNL_PREFIX+"STR"+IntegerToString(s);
       PanelLabel(id, x2, y, line, statClr, InpPanelFontSize);
       y += 22;
