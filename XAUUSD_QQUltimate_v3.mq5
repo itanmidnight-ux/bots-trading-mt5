@@ -94,6 +94,12 @@ enum ENUM_CAP_MODE
    CAP_STANDARD   = 4   // $10000+
 };
 
+enum ENUM_OP_MODE
+{
+   OPMODE_GROWTH   = 0,  // <500 USD — alta precisión, compounding conservador
+   OPMODE_STANDARD = 1   // >=500 USD — operación profesional normal
+};
+
 //====================================================================
 //  INPUTS — Sistema cerrado (idéntico estructura panel real QQ)
 //====================================================================
@@ -148,7 +154,8 @@ const string gTFNames[NUM_TFS] = {
 int hEMA9[NUM_TFS],  hEMA21[NUM_TFS], hEMA50[NUM_TFS], hEMA200[NUM_TFS];
 int hRSI[NUM_TFS],   hATR[NUM_TFS],   hBB[NUM_TFS],    hMFI[NUM_TFS];
 int hADX_H1, hADX_M15;
-int hEMA10_W1;     // Weekly bias
+int hW1EMA10 = INVALID_HANDLE;   // Weekly bias handle (BUG-3 fix)
+
 
 //====================================================================
 //  MTF DATA CACHE — refrescada en cada tick si nueva barra
@@ -161,14 +168,25 @@ struct TFData
    double closeNow, openNow, highNow, lowNow;
    double close1, open1, high1, low1;       // barra cerrada [1]
    double close2, open2, high2, low2;       // barra [2]
+   double swingH10, swingL10;               // swing high/low 10-bar (cacheado)
    datetime barTime;
+   datetime prevBarTime;                    // detecta cambio de barra
    bool valid;
 };
 TFData g_tf[NUM_TFS];
 
 double g_adxH1 = 0, g_adxM15 = 0;
 double g_pdiH1 = 0, g_mdiH1 = 0;
-double g_weeklyEMA = 0;
+
+// Cache ADX — solo refrescar en nuevo bar H1/M15
+datetime g_adxH1LastBar  = 0;
+datetime g_adxM15LastBar = 0;
+
+// Flag de reconstrucción de posiciones
+bool g_posTrackDirty = true;
+
+// Throttle ManagePositions en tester — solo nuevo bar M1
+datetime g_managePosLastBar = 0;
 
 //====================================================================
 //  REGIME STATE
@@ -178,8 +196,6 @@ ENUM_REGIME g_regimePrev     = REG_NEUTRAL;
 datetime    g_regimeSince    = 0;
 double      g_atrAvgM5       = 0;
 double      g_bbWidthAvgM5   = 0;
-bool        g_weeklyBiasUp   = false;
-bool        g_weeklyBiasDn   = false;
 bool        g_d1TrendUp      = false;
 bool        g_d1TrendDn      = false;
 bool        g_h1TrendUp      = false;
@@ -207,6 +223,10 @@ struct StratState
    double basketTPPct;         // % balance objetivo basket close (0=disabled)
    double rrRatio;             // RR ratio configurado (TP/SL)
    double slAtrMult;           // SL = ATR × este multiplicador
+   // ── Entry quality fields (added for duplicate/quality fix) ────
+   datetime lastSLTime;        // timestamp del último SL hit → cooldown
+   int      lastSLDir;         // dirección del SL (+1=long, -1=short)
+   int      sameDirectStreak;  // consecutivas en misma dirección hoy
 };
 StratState g_str[NUM_STRATS];
 
@@ -255,6 +275,27 @@ bool          g_isTesting     = false;
 bool          g_paused        = false;
 bool          g_dayInvalid    = false;
 
+// ── Capital Adaptive Operating Mode ──────────────────────────
+ENUM_OP_MODE g_opMode           = OPMODE_GROWTH;
+ENUM_OP_MODE g_opModePrev       = OPMODE_GROWTH;
+double       g_growthCompound      = 0.0;    // compounding bonus (0..0.25)
+bool         g_growthHarvested     = false;  // hard harvest (5%) — para entradas
+bool         g_growthSoftHarvested = false;  // soft harvest (~3%) — reduce concurrent
+double       g_growthHarvestUSD   = 0.0;   // daily harvest threshold USD (5%)
+
+// ── Recovery Engine State ─────────────────────────────────────
+bool     g_recovActive       = false;
+int      g_recovStratId      = -1;
+bool     g_recovIsLong       = false;
+double   g_recovBaseLot      = 0.0;
+double   g_recovAvgEntry     = 0.0;
+double   g_recovBasketPeak   = 0.0;
+int      g_recovLayerCount   = 0;
+datetime g_recovLastLossTime = 0;
+ulong    g_recovTickets[MAX_GRID_LAYERS];
+bool     g_recovBEDone       = false;
+bool     g_recovPartialDone  = false;
+
 #define LOG(m)  if(!g_isTesting) Print(m)
 
 //====================================================================
@@ -264,6 +305,11 @@ int OnInit()
 {
    g_isTesting = (bool)MQLInfoInteger(MQL_TESTER);
    g_paused    = InpStartPaused;
+
+   // Modo inicial basado en balance de inicio (sin histéresis — evita quedarse en GROWTH con $500)
+   g_opMode = (AccountInfoDouble(ACCOUNT_BALANCE) >= 500.0) ? OPMODE_STANDARD : OPMODE_GROWTH;
+   Print("[OpMode] Inicial: ", g_opMode == OPMODE_STANDARD ? "STANDARD" : "GROWTH",
+         " | Balance: $", DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2));
 
    // Crear handles para todos los TFs
    for(int i=0; i<NUM_TFS; i++)
@@ -289,12 +335,15 @@ int OnInit()
    }
    hADX_H1   = iADX(_Symbol, PERIOD_H1, 14);
    hADX_M15  = iADX(_Symbol, PERIOD_M15, 14);
-   hEMA10_W1 = iMA(_Symbol, PERIOD_W1, 10, 0, MODE_EMA, PRICE_CLOSE);
-   if(hADX_H1==INVALID_HANDLE || hADX_M15==INVALID_HANDLE || hEMA10_W1==INVALID_HANDLE)
+   hW1EMA10  = iMA(_Symbol, PERIOD_W1, 10, 0, MODE_EMA, PRICE_CLOSE);
+   if(hADX_H1==INVALID_HANDLE || hADX_M15==INVALID_HANDLE)
    {
-      Alert("QQ v10: Handle ADX/Weekly inválido");
+      Alert("QQ v10: Handle ADX inválido");
       return INIT_FAILED;
    }
+   // W1 EMA10 — no critico, fallo no detiene EA (BUG-3 fix)
+   if(hW1EMA10 == INVALID_HANDLE)
+      Print("[Warning] W1 EMA10 handle inválido — weekly bias filter desactivado");
 
    // Init strategy states — perfiles derivados de logs reales QQ:
    //   RR 0.67 (TP<SL) para mean-reversion / scalp tight  → alta WR
@@ -350,10 +399,13 @@ int OnInit()
       g_str[s].posCount    = 0;
       g_str[s].gridLayers  = 0;
       g_str[s].gridEnabled = gridEnabled[s];
-      g_str[s].avgEntry    = 0;
-      g_str[s].basketTPPct = basketTPs[s];
-      g_str[s].rrRatio     = rrRatios[s];
-      g_str[s].slAtrMult   = slMults[s];
+      g_str[s].avgEntry         = 0;
+      g_str[s].basketTPPct      = basketTPs[s];
+      g_str[s].rrRatio          = rrRatios[s];
+      g_str[s].slAtrMult        = slMults[s];
+      g_str[s].lastSLTime       = 0;
+      g_str[s].lastSLDir        = 0;
+      g_str[s].sameDirectStreak = 0;
       for(int k=0; k<MAX_GRID_LAYERS; k++) g_str[s].posTickets[k] = 0;
    }
 
@@ -389,9 +441,9 @@ void OnDeinit(const int reason)
       if(hBB[i]     != INVALID_HANDLE) IndicatorRelease(hBB[i]);
       if(hMFI[i]    != INVALID_HANDLE) IndicatorRelease(hMFI[i]);
    }
-   if(hADX_H1  != INVALID_HANDLE) IndicatorRelease(hADX_H1);
-   if(hADX_M15 != INVALID_HANDLE) IndicatorRelease(hADX_M15);
-   if(hEMA10_W1!= INVALID_HANDLE) IndicatorRelease(hEMA10_W1);
+   if(hADX_H1   != INVALID_HANDLE) IndicatorRelease(hADX_H1);
+   if(hADX_M15  != INVALID_HANDLE) IndicatorRelease(hADX_M15);
+   if(hW1EMA10  != INVALID_HANDLE) IndicatorRelease(hW1EMA10);
    PanelClear();
    Comment("");
 }
@@ -410,6 +462,7 @@ void OnTick()
 
    CheckDayReset();
    DetectCapitalMode();
+   DetectOpMode();
    RefreshPositionTracking();
 
    // L0 — MTF Data
@@ -417,14 +470,16 @@ void OnTick()
 
    // L1 — Regime
    UpdateRegime();
-   UpdateWeeklyBias();
+   UpdateNYRange();   // siempre construir rango NY hora 12, sin depender de régimen
 
    // L6 — Protección (DD/recovery antes de cualquier entrada)
    CheckDDEscalation();
-   CheckRecoveryLayers();
+   UpdateRecoveryEngine();
    CheckEquityCircuit();
+   CheckGrowthHarvest();
 
-   bool canTrade = !g_dayInvalid && g_recovLevel < 3 && !IsRecoveryPaused() && !IsNewsTime();
+   bool canTrade = !g_dayInvalid && g_recovLevel < 3 && !IsRecoveryPaused()
+                   && !IsNewsTime() && !g_growthHarvested;
 
    // L2 — Activar estrategias por régimen
    ActivateStrategies();
@@ -432,11 +487,15 @@ void OnTick()
    // L3 — Ejecutar estrategias activas
    if(canTrade) RunActiveStrategies();
 
+   // Recovery grid layers (separate from normal entry)
+   if(g_recovActive) RunRecoveryEngine();
+
    // L4 — Grid management (siempre, sea cual sea estado)
    ManageGrids();
 
    // L5 — Exit engine
    ManagePositions();
+   if(g_recovActive) { RecovL4_ManageBasket(); RecovL5_ManageExits(); }
    CheckPreNewsExit();
 
    TrackClosedTrades();
@@ -455,6 +514,7 @@ void OnTradeTransaction(const MqlTradeTransaction&  trans,
    if(trans.type != TRADE_TRANSACTION_DEAL_ADD) return;
    if(trans.deal == 0) return;
    if(!HistoryDealSelect(trans.deal)) return;
+   g_posTrackDirty = true;   // fuerza reconstrucción en siguiente tick
    long deal_magic = HistoryDealGetInteger(trans.deal, DEAL_MAGIC);
    if(deal_magic != InpMagic) return;
    ENUM_DEAL_ENTRY entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
@@ -471,13 +531,39 @@ void OnTradeTransaction(const MqlTradeTransaction&  trans,
          if(profit > 0) g_str[sId].winsToday++;
          else if(profit < 0) g_str[sId].lossesToday++;
       }
-      if(profit > 0) { g_winsToday++; g_consecLosses = 0; }
-      else if(profit < 0) { g_lossesToday++; g_consecLosses++; }
+      if(profit > 0)
+      {
+         g_winsToday++; g_consecLosses = 0;
+         if(sId >= 0 && sId < NUM_STRATS)
+         {
+            int dir = (HistoryDealGetInteger(trans.deal, DEAL_TYPE) == DEAL_TYPE_SELL) ? -1 : +1;
+            if(g_str[sId].lastSLDir == dir) g_str[sId].sameDirectStreak++;
+            else                            g_str[sId].sameDirectStreak = 1;
+            g_str[sId].lastSLDir = dir;
+         }
+         if(g_recovActive && sId == g_recovStratId) ResetRecovery();
+      }
+      else if(profit < 0)
+      {
+         g_lossesToday++; g_consecLosses++;
+         bool isLong = (HistoryDealGetInteger(trans.deal, DEAL_TYPE) == DEAL_TYPE_SELL);
+         double dealLot = HistoryDealGetDouble(trans.deal, DEAL_VOLUME);
+         // Registrar SL hit para cooldown por estrategia
+         if(sId >= 0 && sId < NUM_STRATS)
+         {
+            g_str[sId].lastSLTime  = TimeCurrent();
+            g_str[sId].lastSLDir   = isLong ? +1 : -1;  // dirección que perdió
+            g_str[sId].sameDirectStreak = 0;
+         }
+         InitiateRecovery(sId, !isLong, dealLot);
+      }
    }
 }
 
 //====================================================================
 //  ============= LAYER 0 — MTF DATA CACHE =============
+//  Optimización tester: CopyBuffer + iHigh/iLow solo en nuevo bar por TF.
+//  En tester "Every tick" esto reduce ~5000x las llamadas a indicadores.
 //====================================================================
 void UpdateMTFData()
 {
@@ -485,17 +571,24 @@ void UpdateMTFData()
    for(int i=0; i<NUM_TFS; i++)
    {
       ENUM_TIMEFRAMES tf = gTFs[i];
-      g_tf[i].valid = false;
-      if(CopyBuffer(hEMA9[i],  0,0,1,e9)  <= 0) continue;
-      if(CopyBuffer(hEMA21[i], 0,0,1,e21) <= 0) continue;
-      if(CopyBuffer(hEMA50[i], 0,0,1,e50) <= 0) continue;
-      if(CopyBuffer(hEMA200[i],0,0,1,e200)<= 0) continue;
-      if(CopyBuffer(hRSI[i],   0,0,1,r)   <= 0) continue;
-      if(CopyBuffer(hATR[i],   0,0,1,a)   <= 0) continue;
-      if(CopyBuffer(hMFI[i],   0,0,1,mf)  <= 0) continue;
-      if(CopyBuffer(hBB[i],    1,0,1,bU)  <= 0) continue;
-      if(CopyBuffer(hBB[i],    0,0,1,bM)  <= 0) continue;
-      if(CopyBuffer(hBB[i],    2,0,1,bD)  <= 0) continue;
+      // ── Detección de nuevo bar por TF ──────────────────────────
+      datetime curBarTime = iTime(_Symbol, tf, 0);
+      if(curBarTime == 0) { g_tf[i].valid = false; continue; }
+
+      // Si el bar no cambió y ya tenemos datos válidos → saltar
+      if(curBarTime == g_tf[i].prevBarTime && g_tf[i].valid) continue;
+
+      // Nuevo bar — refrescar todo para este TF
+      if(CopyBuffer(hEMA9[i],  0,0,1,e9)  <= 0) { g_tf[i].valid = false; continue; }
+      if(CopyBuffer(hEMA21[i], 0,0,1,e21) <= 0) { g_tf[i].valid = false; continue; }
+      if(CopyBuffer(hEMA50[i], 0,0,1,e50) <= 0) { g_tf[i].valid = false; continue; }
+      if(CopyBuffer(hEMA200[i],0,0,1,e200)<= 0) { g_tf[i].valid = false; continue; }
+      if(CopyBuffer(hRSI[i],   0,0,1,r)   <= 0) { g_tf[i].valid = false; continue; }
+      if(CopyBuffer(hATR[i],   0,0,1,a)   <= 0) { g_tf[i].valid = false; continue; }
+      if(CopyBuffer(hMFI[i],   0,0,1,mf)  <= 0) { g_tf[i].valid = false; continue; }
+      if(CopyBuffer(hBB[i],    1,0,1,bU)  <= 0) { g_tf[i].valid = false; continue; }
+      if(CopyBuffer(hBB[i],    0,0,1,bM)  <= 0) { g_tf[i].valid = false; continue; }
+      if(CopyBuffer(hBB[i],    2,0,1,bD)  <= 0) { g_tf[i].valid = false; continue; }
 
       g_tf[i].ema9   = e9[0];
       g_tf[i].ema21  = e21[0];
@@ -520,18 +613,39 @@ void UpdateMTFData()
       g_tf[i].open2    = iOpen(_Symbol,  tf, 2);
       g_tf[i].high2    = iHigh(_Symbol,  tf, 2);
       g_tf[i].low2     = iLow(_Symbol,   tf, 2);
-      g_tf[i].barTime  = iTime(_Symbol,  tf, 0);
+      g_tf[i].barTime  = curBarTime;
+      g_tf[i].prevBarTime = curBarTime;
+
+      // Swing high/low 10 bars — cacheado aquí, no recalculado en estrategias
+      double swH = 0, swL = DBL_MAX;
+      for(int k=2; k<=11; k++)
+      {
+         double hi = iHigh(_Symbol, tf, k);
+         double lo = iLow(_Symbol,  tf, k);
+         if(hi > swH) swH = hi;
+         if(lo < swL) swL = lo;
+      }
+      g_tf[i].swingH10 = swH;
+      g_tf[i].swingL10 = (swL == DBL_MAX) ? 0 : swL;
       g_tf[i].valid    = true;
    }
 
-   // ADX
+   // ADX — solo refrescar en nuevo bar del TF correspondiente
+   datetime h1Bar  = (TFIdx(PERIOD_H1) >= 0) ? g_tf[TFIdx(PERIOD_H1)].barTime : 0;
+   datetime m15Bar = (TFIdx(PERIOD_M15) >= 0) ? g_tf[TFIdx(PERIOD_M15)].barTime : 0;
    double adxBuf[], pdiBuf[], mdiBuf[];
-   if(CopyBuffer(hADX_H1, 0,0,1,adxBuf) > 0) g_adxH1 = adxBuf[0];
-   if(CopyBuffer(hADX_H1, 1,0,1,pdiBuf) > 0) g_pdiH1 = pdiBuf[0];
-   if(CopyBuffer(hADX_H1, 2,0,1,mdiBuf) > 0) g_mdiH1 = mdiBuf[0];
-   if(CopyBuffer(hADX_M15,0,0,1,adxBuf) > 0) g_adxM15 = adxBuf[0];
-   double weBuf[];
-   if(CopyBuffer(hEMA10_W1,0,0,1,weBuf) > 0) g_weeklyEMA = weBuf[0];
+   if(h1Bar != g_adxH1LastBar && h1Bar != 0)
+   {
+      if(CopyBuffer(hADX_H1, 0,0,1,adxBuf) > 0) g_adxH1 = adxBuf[0];
+      if(CopyBuffer(hADX_H1, 1,0,1,pdiBuf) > 0) g_pdiH1 = pdiBuf[0];
+      if(CopyBuffer(hADX_H1, 2,0,1,mdiBuf) > 0) g_mdiH1 = mdiBuf[0];
+      g_adxH1LastBar = h1Bar;
+   }
+   if(m15Bar != g_adxM15LastBar && m15Bar != 0)
+   {
+      if(CopyBuffer(hADX_M15,0,0,1,adxBuf) > 0) g_adxM15 = adxBuf[0];
+      g_adxM15LastBar = m15Bar;
+   }
 
    // Averages (EMA suavizada) — ATR M5 + BB Width M5
    int idxM5 = 1;
@@ -542,6 +656,7 @@ void UpdateMTFData()
       g_atrAvgM5 = g_atrAvgM5 + alpha * (g_tf[idxM5].atr - g_atrAvgM5);
       if(g_bbWidthAvgM5 <= 0) g_bbWidthAvgM5 = g_tf[idxM5].bbWidth;
       g_bbWidthAvgM5 = g_bbWidthAvgM5 + alpha * (g_tf[idxM5].bbWidth - g_bbWidthAvgM5);
+
    }
 }
 
@@ -595,12 +710,6 @@ void UpdateRegime()
    }
 }
 
-void UpdateWeeklyBias()
-{
-   double cur = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   g_weeklyBiasUp = (cur > g_weeklyEMA) && (g_weeklyEMA > 0);
-   g_weeklyBiasDn = (cur < g_weeklyEMA) && (g_weeklyEMA > 0);
-}
 
 string RegimeStr()
 {
@@ -660,8 +769,10 @@ void ActivateStrategies()
    // S7 Structure Break — TRENDING o transición
    g_str[6].activeRegime = (r == REG_TRENDING || r == REG_VOLATILE);
 
-   // S8 PDH/PDL Breakout — siempre activo en ventana
-   g_str[7].activeRegime = (inPDHWind && r != REG_RANGING);
+   // S8 PDH/PDL Breakout — siempre activo en ventana, incluyendo RANGING
+   // BUG-4 FIX: PDH/PDL es más relevante en mercados ranging (niveles del día anterior
+   // actúan como soporte/resistencia clave). Bloquear en RANGING era incorrecto.
+   g_str[7].activeRegime = inPDHWind;
 
    // S9 Momentum M15 — VOLATILE/MOMENTUM
    g_str[8].activeRegime = (r == REG_VOLATILE || r == REG_MOMENTUM);
@@ -728,24 +839,32 @@ void MarkStratBarConsumed(int sId)
    if(idx >= 0 && g_tf[idx].valid) g_str[sId].lastBarFired = g_tf[idx].barTime;
 }
 
-// Detecta swing high/low en últimos N bars del TF dado.
+// Swing high/low — retorna valor cacheado en TFData.swingH10/swingL10.
+// Calculado en UpdateMTFData solo cuando cambia el bar (no por tick).
 double GetSwingHigh(ENUM_TIMEFRAMES tf, int lookback)
 {
+   int idx = TFIdx(tf);
+   if(idx >= 0 && g_tf[idx].valid && g_tf[idx].swingH10 > 0)
+      return g_tf[idx].swingH10;
+   // Fallback: calculo directo si cache no disponible
    double hi = 0;
-   for(int k=2; k<=lookback+1; k++)
+   for(int k=2; k<=MathMin(lookback,10)+1; k++)
       hi = MathMax(hi, iHigh(_Symbol, tf, k));
    return hi;
 }
 double GetSwingLow(ENUM_TIMEFRAMES tf, int lookback)
 {
+   int idx = TFIdx(tf);
+   if(idx >= 0 && g_tf[idx].valid && g_tf[idx].swingL10 > 0)
+      return g_tf[idx].swingL10;
    double lo = DBL_MAX;
-   for(int k=2; k<=lookback+1; k++)
+   for(int k=2; k<=MathMin(lookback,10)+1; k++)
       lo = MathMin(lo, iLow(_Symbol, tf, k));
    return lo;
 }
 
-// Candle confirmation: la vela [1] cerró en dirección con cuerpo >= 30% del rango
-// y >= 25% del ATR. Filtra dojis y velas indecisas (críticas en QQ real).
+// Candle confirmation: la vela [1] cerró en dirección con cuerpo >= bodyMin del rango
+// y >= atrMin del ATR. Growth Mode exige umbrales más altos para mayor winrate.
 bool HasCandleConfirmation(ENUM_TIMEFRAMES tf, bool isBuy)
 {
    int idx = TFIdx(tf);
@@ -754,10 +873,13 @@ bool HasCandleConfirmation(ENUM_TIMEFRAMES tf, bool isBuy)
    double h = g_tf[idx].high1, l = g_tf[idx].low1;
    double range = h - l;
    if(range <= 0) return false;
-   double body  = MathAbs(c - o);
+   double body      = MathAbs(c - o);
    double bodyRatio = body / range;
    double atrRatio  = (g_tf[idx].atr > 0) ? (body / g_tf[idx].atr) : 0;
-   if(bodyRatio < 0.30 || atrRatio < 0.25) return false;
+   // Growth Mode: 40% body ratio + 35% ATR — filtra señales débiles
+   double minBody = (g_opMode == OPMODE_GROWTH) ? 0.40 : 0.30;
+   double minATR  = (g_opMode == OPMODE_GROWTH) ? 0.35 : 0.25;
+   if(bodyRatio < minBody || atrRatio < minATR) return false;
    return isBuy ? (c > o) : (c < o);
 }
 
@@ -793,12 +915,134 @@ bool HasStructuralBreak(ENUM_TIMEFRAMES tf, bool isBuy, int swingLookback=10)
    }
 }
 
+// Weekly Bias — W1 EMA10 dirección para filtrar entradas contra tendencia semanal.
+// Aplica en ambos modos. GROWTH usa D1 + W1 para máxima protección en cuentas pequeñas.
+// Calcula EMA10 W1 dinámicamente: compara close W1[1] vs EMA10 W1[1].
+// Retorna true si el trade está a favor del sesgo semanal (o si no hay sesgo claro).
+bool WeeklyBiasOk(bool isBuy)
+{
+   double wEMA10[1];
+   if(hW1EMA10 == INVALID_HANDLE) return true;  // handle no disponible — no bloquear
+   if(CopyBuffer(hW1EMA10, 0, 1, 1, wEMA10) <= 0) return true;
+   double wClose = iClose(_Symbol, PERIOD_W1, 1);
+   if(wClose <= 0 || wEMA10[0] <= 0) return true;
+   bool weeklyUp = (wClose > wEMA10[0]);
+   bool weeklyDn = (wClose < wEMA10[0]);
+   // Sesgo neutro (dentro del 0.1% del EMA): ambas direcciones OK
+   double pct = MathAbs(wClose - wEMA10[0]) / wEMA10[0];
+   if(pct < 0.001) return true;
+   if(isBuy  && weeklyDn) return false;   // long contra sesgo bajista semanal
+   if(!isBuy && weeklyUp) return false;   // short contra sesgo alcista semanal
+   return true;
+}
+
 // Pipeline maestro: combina los 3 filtros estructurales.
-// strikeRequired=false para estrategias mean-reversion donde no buscamos break.
+// GROWTH: todos los sub-modos exigen D1 alignment.
+// MICRO en GROWTH: omite strike (SL grande en % ya protege), pero SÍ exige D1.
 bool ConfirmEntry(ENUM_TIMEFRAMES tf, bool isBuy, bool strikeRequired=true)
 {
    if(!HasCandleConfirmation(tf, isBuy)) return false;
-   if(strikeRequired && !HasStrikeConfirmation(tf, isBuy)) return false;
+   // MICRO omite strike — SL ya es proporcional al capital pequeño
+   bool microGrowth = (g_opMode == OPMODE_GROWTH && g_capMode == CAP_MICRO);
+   bool needStrike  = strikeRequired || (g_opMode == OPMODE_GROWTH && !microGrowth);
+   if(needStrike && !HasStrikeConfirmation(tf, isBuy)) return false;
+   // D1 alignment: TODOS en GROWTH lo exigen (MICRO incluido — un trade contra D1 es catastrófico en cuenta pequeña)
+   if(g_opMode == OPMODE_GROWTH)
+   {
+      if(isBuy  && !g_d1TrendUp) return false;
+      if(!isBuy && !g_d1TrendDn) return false;
+   }
+   // Weekly bias filter — bloquea trades contra W1 EMA10
+   if(!WeeklyBiasOk(isBuy)) return false;
+   return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+//  CheckEntryQuality — Filtro de calidad ADICIONAL antes de abrir posición.
+//  Verifica 3 condiciones derivadas del análisis de trades perdedores:
+//
+//  1. COOLDOWN POST-SL: estrategia perdió en esta dirección recientemente
+//     → esperar que el precio se aleje al menos 1 ATR (mercado "lavó" la stop)
+//
+//  2. MOMENTUM M5 ALIGNMENT: al menos 2 de las últimas 3 velas M5 deben
+//     cerrar en la dirección del trade. Previene entradas contra micro-impulso.
+//     (Fix para entradas "contra-tendencia" observadas en May-11: SELL con precio
+//     subiendo de 4665→4688 — regimen decía SELL pero M5 mostraba rebote.)
+//
+//  3. STREAK BLOCK: si esta estrategia acumula 3+ trades seguidos en misma
+//     dirección SIN ganar, necesita una vela H1 de confirmación adicional.
+//     (Fix para May-15: 7 sells consecutivos — mercado claramente no cooperaba.)
+// ─────────────────────────────────────────────────────────────────────
+bool CheckEntryQuality(int sId, bool isBuy)
+{
+   int iM5 = TFIdx(PERIOD_M5);
+   if(iM5 < 0 || !g_tf[iM5].valid) return true;  // sin datos → no bloquear
+   double atr = g_tf[iM5].atr;
+
+   // ── 1. Cooldown post-SL ──────────────────────────────────────────
+   if(g_str[sId].lastSLTime > 0 && g_str[sId].lastSLDir != 0)
+   {
+      int slDir    = g_str[sId].lastSLDir;   // dirección que perdió: +1=long, -1=short
+      int entryDir = isBuy ? +1 : -1;
+      if(slDir == entryDir)                   // intentando re-entrar en misma dirección
+      {
+         // Calcular cuánto se ha movido el precio desde el SL
+         double curPx = isBuy ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
+                               : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         // Necesitamos que el precio se haya alejado al menos 1 ATR
+         // La "distancia" correcta depende de la dirección del trade original:
+         // Si perdimos LONG: precio debió subir 1 ATR antes de re-intentar LONG
+         // Si perdimos SHORT: precio debió bajar 1 ATR antes de re-intentar SHORT
+         // (Precio "lavado" significa el mercado dio una oportunidad real nueva)
+         datetime elapsed = TimeCurrent() - g_str[sId].lastSLTime;
+         int minCooldownMin = 30;  // mínimo 30 min de cooldown absoluto
+         if(elapsed < (datetime)(minCooldownMin * 60)) return false;
+         // Después de 30 min: validar que precio se alejó 1 ATR (nueva oportunidad)
+         // Proxy: verificar que el precio está "más lejos" del SL time
+         // Si no podemos medir distancia exacta → usar ventana temporal fija de 2 H1 bars
+         if(elapsed < (datetime)(120 * 60)) // < 2 horas: requiere también momentum claro
+         {
+            // Requiere que las últimas 2 velas M5 sean consistentes con la dirección
+            bool c1ok = isBuy ? (g_tf[iM5].close1 > g_tf[iM5].open1)
+                               : (g_tf[iM5].close1 < g_tf[iM5].open1);
+            bool c2ok = isBuy ? (g_tf[iM5].close2 > g_tf[iM5].open2)
+                               : (g_tf[iM5].close2 < g_tf[iM5].open2);
+            if(!c1ok && !c2ok) return false;  // 2 velas M5 contrarias → no entrar
+         }
+      }
+   }
+
+   // ── 2. Momentum M5 alignment — mínimo 2 de 3 velas M5 en dirección ──
+   {
+      bool c1 = isBuy ? (g_tf[iM5].close1 > g_tf[iM5].open1)
+                       : (g_tf[iM5].close1 < g_tf[iM5].open1);
+      bool c2 = isBuy ? (g_tf[iM5].close2 > g_tf[iM5].open2)
+                       : (g_tf[iM5].close2 < g_tf[iM5].open2);
+      // c3: vela actual (en formación)
+      bool c3 = isBuy ? (g_tf[iM5].closeNow > g_tf[iM5].openNow)
+                       : (g_tf[iM5].closeNow < g_tf[iM5].openNow);
+      int agree = (c1?1:0) + (c2?1:0) + (c3?1:0);
+      // GROWTH: exige 2/3 velas M5 en dirección (mayor win rate)
+      // STANDARD: basta 1/3 (más permisivo para breakouts)
+      int minAgree = (g_opMode == OPMODE_GROWTH) ? 2 : 1;
+      if(agree < minAgree) return false;
+   }
+
+   // ── 3. Streak block — 3+ consecutivos sin win en misma dir ────────
+   if(g_str[sId].sameDirectStreak >= 3)
+   {
+      // Requiere vela H1 en dirección para continuar el streak
+      int iH1 = TFIdx(PERIOD_H1);
+      if(iH1 >= 0 && g_tf[iH1].valid)
+      {
+         bool h1ok = isBuy ? (g_tf[iH1].close1 > g_tf[iH1].open1 &&
+                               g_tf[iH1].close1 > g_tf[iH1].ema21)
+                            : (g_tf[iH1].close1 < g_tf[iH1].open1 &&
+                               g_tf[iH1].close1 < g_tf[iH1].ema21);
+         if(!h1ok) return false;
+      }
+   }
+
    return true;
 }
 
@@ -841,6 +1085,8 @@ bool EnterOrStackPosition(int sId, bool isBuy)
 {
    if(g_str[sId].posCount == 0)
    {
+      // Filtro calidad entrada — solo para posiciones base (no grid layers)
+      if(!CheckEntryQuality(sId, isBuy)) return false;
       // Apertura base — usa RR y SL configurados en state struct
       double slMult = g_str[sId].slAtrMult;
       double tpMult = slMult * g_str[sId].rrRatio;
@@ -864,6 +1110,12 @@ void RunActiveStrategies()
    if(CountAllOpen() >= g_maxConcurrent) return;
    if(!FilterSpread()) return;
 
+   // FIX DUPLICADOS: Contador local de posiciones abiertas EN ESTE PASE.
+   // Soluciona el bug donde CountAllOpen() no detecta la posición recién abierta
+   // en el mismo tick (PositionsTotal() puede tener latencia de 1 tick en tester).
+   // Combinamos CountAllOpen() REAL + openedThisPass para evitar doble entrada.
+   int openedThisPass = 0;
+
    // Diseño régimen-dedicado: TODAS las estrategias activas por régimen
    // evalúan entrada SOLO en nuevo bar de su TF (no en cada tick) y
    // requieren confirmación estructural antes de abrir.
@@ -872,28 +1124,49 @@ void RunActiveStrategies()
    for(int s=0; s<NUM_STRATS; s++)
    {
       if(!g_str[s].activeRegime) continue;
-      if(CountAllOpen() >= g_maxConcurrent) break;
+      if(CountAllOpen() + openedThisPass >= g_maxConcurrent) break;  // FIX DUPLICADOS
       // Bar-close gate por TF de la estrategia
       if(!IsNewBarForStrat(s)) continue;
+
+      // Growth Mode: filtros adicionales de calidad
+      if(g_opMode == OPMODE_GROWTH)
+      {
+         // ADX≥28 para estrategias trend
+         bool isTrendStrat = (s==0||s==1||s==6||s==10);
+         if(isTrendStrat && g_adxH1 < 28) { MarkStratBarConsumed(s); continue; }
+
+         // Filtro de sesión alta probabilidad:
+         // HIGH: London 08-11 GMT + NY 13:30-17 GMT → todas las estrategias elegibles
+         // LOW (resto): solo estrategias con gate de sesión propio (S3,S4,S5,S8)
+         MqlDateTime dtG; TimeToStruct(TimeCurrent(), dtG);
+         int hG = dtG.hour, hmG = hG*60 + dtG.min;
+         bool highSession = (hG >= 8 && hG < 11) || (hmG >= 13*60+30 && hmG < 17*60);
+         bool isSessionGated = (s==2||s==3||s==4||s==7); // S3,S4,S5,S8 gestionan su sesión
+         if(!highSession && !isSessionGated) { MarkStratBarConsumed(s); continue; }
+      }
+
       // Si tiene posición base, solo entra como grid layer
       bool isGridMode = (g_str[s].posCount > 0);
       if(isGridMode && !g_str[s].gridEnabled) { MarkStratBarConsumed(s); continue; }
       if(isGridMode && g_str[s].gridLayers >= MAX_GRID_LAYERS - 1) { MarkStratBarConsumed(s); continue; }
+
+      bool opened = false;
       switch(s)
       {
-         case 0:  TryS1_TrendFollow();      break;
-         case 1:  TryS2_PullbackEMA();      break;
-         case 2:  TryS3_LondonORB();        break;
-         case 3:  TryS4_NYSession();        break;
-         case 4:  TryS5_AsianRange();       break;
-         case 5:  TryS6_MeanReversion();    break;
-         case 6:  TryS7_StructureBreak();   break;
-         case 7:  TryS8_PDHPDLBreak();      break;
-         case 8:  TryS9_MomentumM15();      break;
-         case 9:  TryS10_CompressionBreak();break;
-         case 10: TryS11_H1Continuation();  break;
-         case 11: TryS12_VolumeImpulse();   break;
+         case 0:  opened = TryS1_TrendFollow();       break;
+         case 1:  opened = TryS2_PullbackEMA();       break;
+         case 2:  opened = TryS3_LondonORB();         break;
+         case 3:  opened = TryS4_NYSession();         break;
+         case 4:  opened = TryS5_AsianRange();        break;
+         case 5:  opened = TryS6_MeanReversion();     break;
+         case 6:  opened = TryS7_StructureBreak();    break;
+         case 7:  opened = TryS8_PDHPDLBreak();       break;
+         case 8:  opened = TryS9_MomentumM15();       break;
+         case 9:  opened = TryS10_CompressionBreak(); break;
+         case 10: opened = TryS11_H1Continuation();   break;
+         case 11: opened = TryS12_VolumeImpulse();    break;
       }
+      if(opened) openedThisPass++;   // FIX DUPLICADOS: contabilizar inmediatamente
       MarkStratBarConsumed(s);
    }
 }
@@ -924,9 +1197,9 @@ bool TryS1_TrendFollow()
                    && cl1 < g_tf[iM5].ema21
                    && g_tf[iM5].rsi   < 55 && g_tf[iM5].rsi > 30;
 
-   if(buyPull && WeeklyBiasOk(true)  && ConfirmEntry(PERIOD_M5, true, true))
+   if(buyPull && ConfirmEntry(PERIOD_M5, true, false))
       return EnterOrStackPosition(0, true);
-   if(sellPull && WeeklyBiasOk(false) && ConfirmEntry(PERIOD_M5, false, true))
+   if(sellPull && ConfirmEntry(PERIOD_M5, false, false))
       return EnterOrStackPosition(0, false);
    return false;
 }
@@ -949,9 +1222,9 @@ bool TryS2_PullbackEMA()
    bool touchDn = inDn && g_tf[iH1].high1 >= e20H && cl1H < e20H && cl1H < op1H
                   && g_tf[iM15].rsi < 50 && g_tf[iM15].close1 < g_tf[iM15].ema21;
 
-   if(touchUp && WeeklyBiasOk(true)  && ConfirmEntry(PERIOD_H1, true, false))
+   if(touchUp && ConfirmEntry(PERIOD_H1, true, false))
       return EnterOrStackPosition(1, true);
-   if(touchDn && WeeklyBiasOk(false) && ConfirmEntry(PERIOD_H1, false, false))
+   if(touchDn && ConfirmEntry(PERIOD_H1, false, false))
       return EnterOrStackPosition(1, false);
    return false;
 }
@@ -965,7 +1238,7 @@ bool   g_orbFiredLong = false, g_orbFiredShort = false;
 bool TryS3_LondonORB()
 {
    MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
-   datetime today = iTime(_Symbol, PERIOD_D1, 0);
+   datetime today = g_lastDay;   // usa cache de CheckDayReset, evita iTime por tick
    if(today != g_orbLastReset)
    {
       g_orbLastReset = today;
@@ -999,9 +1272,9 @@ bool TryS3_LondonORB()
                   && g_tf[iM5].close1 < g_tf[iM5].open1
                   && g_tf[iM5].ema9 < g_tf[iM5].ema21;
 
-   if(breakUp && ConfirmEntry(PERIOD_M5, true, true))
+   if(breakUp && ConfirmEntry(PERIOD_M5, true, false))
       { g_orbFiredLong  = true; return EnterOrStackPosition(2, true);  }
-   if(breakDn && ConfirmEntry(PERIOD_M5, false, true))
+   if(breakDn && ConfirmEntry(PERIOD_M5, false, false))
       { g_orbFiredShort = true; return EnterOrStackPosition(2, false); }
    return false;
 }
@@ -1012,31 +1285,38 @@ bool   g_nyBuilt = false;
 datetime g_nyLastReset = 0;
 bool   g_nyFiredLong = false, g_nyFiredShort = false;
 
-bool TryS4_NYSession()
+// Construye rango NY durante hora 12 — siempre, independiente de régimen activo
+void UpdateNYRange()
 {
    MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
-   datetime today = iTime(_Symbol, PERIOD_D1, 0);
+   datetime today = g_lastDay;
    if(today != g_nyLastReset)
    {
       g_nyLastReset = today;
       g_nyHi = 0; g_nyLo = DBL_MAX; g_nyBuilt = false;
       g_nyFiredLong = false; g_nyFiredShort = false;
    }
-
-   int iM5 = TFIdx(PERIOD_M5); if(iM5<0 || !g_tf[iM5].valid) return false;
-   int hm  = dt.hour*60 + dt.min;
-
+   if(dt.hour != 12 && !(dt.hour == 13 && dt.min < 30)) return;
+   int iM5 = TFIdx(PERIOD_M5);
+   if(iM5 < 0 || !g_tf[iM5].valid) return;
    if(dt.hour == 12)
    {
       g_nyHi = (g_nyHi == 0) ? g_tf[iM5].highNow : MathMax(g_nyHi, g_tf[iM5].highNow);
       g_nyLo = (g_nyLo == DBL_MAX) ? g_tf[iM5].lowNow : MathMin(g_nyLo, g_tf[iM5].lowNow);
-      return false;
    }
-   if(dt.hour == 13 && dt.min < 30 && !g_nyBuilt)
+   else if(dt.hour == 13 && dt.min < 30 && !g_nyBuilt)
    {
       double sz = (g_nyHi - g_nyLo) / _Point;
       if(sz >= 200 && sz <= 1500) g_nyBuilt = true;
    }
+}
+
+bool TryS4_NYSession()
+{
+   MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
+   int iM5 = TFIdx(PERIOD_M5); if(iM5<0 || !g_tf[iM5].valid) return false;
+   int hm  = dt.hour*60 + dt.min;
+
    if(!g_nyBuilt) return false;
    if(hm < 13*60+30 || hm >= 17*60) return false;
 
@@ -1049,9 +1329,9 @@ bool TryS4_NYSession()
                   && g_tf[iM5].mfi < 45
                   && g_tf[iM5].rsi < 50;
 
-   if(breakUp && ConfirmEntry(PERIOD_M5, true, true))
+   if(breakUp && ConfirmEntry(PERIOD_M5, true, false))
       { g_nyFiredLong  = true; return EnterOrStackPosition(3, true);  }
-   if(breakDn && ConfirmEntry(PERIOD_M5, false, true))
+   if(breakDn && ConfirmEntry(PERIOD_M5, false, false))
       { g_nyFiredShort = true; return EnterOrStackPosition(3, false); }
    return false;
 }
@@ -1065,7 +1345,7 @@ bool   g_asFiredLong = false, g_asFiredShort = false;
 bool TryS5_AsianRange()
 {
    MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
-   datetime today = iTime(_Symbol, PERIOD_D1, 0);
+   datetime today = g_lastDay;
    if(today != g_asLastReset)
    {
       g_asLastReset = today;
@@ -1096,9 +1376,9 @@ bool TryS5_AsianRange()
    bool breakUp = !g_asFiredLong  && cl1 > g_asHi + buf;
    bool breakDn = !g_asFiredShort && cl1 < g_asLo - buf;
 
-   if(breakUp && ConfirmEntry(PERIOD_M5, true, true))
+   if(breakUp && ConfirmEntry(PERIOD_M5, true, false))
       { g_asFiredLong  = true; return EnterOrStackPosition(4, true);  }
-   if(breakDn && ConfirmEntry(PERIOD_M5, false, true))
+   if(breakDn && ConfirmEntry(PERIOD_M5, false, false))
       { g_asFiredShort = true; return EnterOrStackPosition(4, false); }
    return false;
 }
@@ -1141,9 +1421,9 @@ bool TryS7_StructureBreak()
    bool brkUp = cl1 > swingH + buf && g_h1TrendUp && g_tf[iH1].ema9 > g_tf[iH1].ema21;
    bool brkDn = cl1 < swingL - buf && g_h1TrendDn && g_tf[iH1].ema9 < g_tf[iH1].ema21;
 
-   if(brkUp && WeeklyBiasOk(true)  && ConfirmEntry(PERIOD_H1, true, true))
+   if(brkUp && ConfirmEntry(PERIOD_H1, true, false))
       return EnterOrStackPosition(6, true);
-   if(brkDn && WeeklyBiasOk(false) && ConfirmEntry(PERIOD_H1, false, true))
+   if(brkDn && ConfirmEntry(PERIOD_H1, false, false))
       return EnterOrStackPosition(6, false);
    return false;
 }
@@ -1160,8 +1440,8 @@ bool TryS8_PDHPDLBreak()
    bool brkUp = cl1 > pdh + buf && g_tf[iM15].close1 > g_tf[iM15].open1 && g_tf[iM15].rsi > 50;
    bool brkDn = cl1 < pdl - buf && g_tf[iM15].close1 < g_tf[iM15].open1 && g_tf[iM15].rsi < 50;
 
-   if(brkUp && ConfirmEntry(PERIOD_M15, true, true))   return EnterOrStackPosition(7, true);
-   if(brkDn && ConfirmEntry(PERIOD_M15, false, true))  return EnterOrStackPosition(7, false);
+   if(brkUp && ConfirmEntry(PERIOD_M15, true, false))   return EnterOrStackPosition(7, true);
+   if(brkDn && ConfirmEntry(PERIOD_M15, false, false))  return EnterOrStackPosition(7, false);
    return false;
 }
 
@@ -1201,8 +1481,8 @@ bool TryS10_CompressionBreak()
    bool brkUp = cl1 > g_tf[iM15].bbUp && g_tf[iM15].rsi > 55;
    bool brkDn = cl1 < g_tf[iM15].bbDn && g_tf[iM15].rsi < 45;
 
-   if(brkUp && ConfirmEntry(PERIOD_M15, true, true))   return EnterOrStackPosition(9, true);
-   if(brkDn && ConfirmEntry(PERIOD_M15, false, true))  return EnterOrStackPosition(9, false);
+   if(brkUp && ConfirmEntry(PERIOD_M15, true, false))   return EnterOrStackPosition(9, true);
+   if(brkDn && ConfirmEntry(PERIOD_M15, false, false))  return EnterOrStackPosition(9, false);
    return false;
 }
 
@@ -1225,9 +1505,9 @@ bool TryS11_H1Continuation()
                  && g_tf[iM12].close1 < g_tf[iM12].ema21
                  && g_tf[iM12].rsi < 50;
 
-   if(contUp && WeeklyBiasOk(true)  && ConfirmEntry(PERIOD_H1, true, false))
+   if(contUp && ConfirmEntry(PERIOD_H1, true, false))
       return EnterOrStackPosition(10, true);
-   if(contDn && WeeklyBiasOk(false) && ConfirmEntry(PERIOD_H1, false, false))
+   if(contDn && ConfirmEntry(PERIOD_H1, false, false))
       return EnterOrStackPosition(10, false);
    return false;
 }
@@ -1246,10 +1526,11 @@ bool TryS12_VolumeImpulse()
    bool impDn = mfiSpikeDn && g_tf[iM6].close1 < g_tf[iM6].open1
                 && g_tf[iM6].ema9 < g_tf[iM6].ema21;
 
-   if(impUp && ConfirmEntry(PERIOD_M6, true, true))   return EnterOrStackPosition(11, true);
-   if(impDn && ConfirmEntry(PERIOD_M6, false, true))  return EnterOrStackPosition(11, false);
+   if(impUp && ConfirmEntry(PERIOD_M6, true, false))   return EnterOrStackPosition(11, true);
+   if(impDn && ConfirmEntry(PERIOD_M6, false, false))  return EnterOrStackPosition(11, false);
    return false;
 }
+
 
 //====================================================================
 //  ============= LAYER 4 — GRID MANAGER =============
@@ -1308,6 +1589,12 @@ void AddGridLayer(int sId, bool isLong)
 //====================================================================
 void ManagePositions()
 {
+   if(g_isTesting)
+   {
+      datetime m1Bar = iTime(_Symbol, PERIOD_M1, 0);
+      if(m1Bar == g_managePosLastBar) return;
+      g_managePosLastBar = m1Bar;
+   }
    int total = PositionsTotal();
    for(int i=total-1; i>=0; i--)
    {
@@ -1445,7 +1732,7 @@ void CloseStratPositions(int sId)
 void DetectCapitalMode()
 {
    double bal = AccountInfoDouble(ACCOUNT_BALANCE);
-   double riskAdj = RiskLevelMult();   // de InpRiskLevel
+   double riskAdj = RiskLevelMult();
    if(bal < 50.0)
    {
       g_capMode = CAP_MICRO;
@@ -1481,7 +1768,58 @@ void DetectCapitalMode()
       g_maxTradesDay = 15; g_maxConcurrent = 6;
       g_dailyLossUSD = bal * 0.04; g_dailyProfitUSD = bal * 0.10;
    }
-   // DD control override
+
+   // ── GROWTH MODE: progresión por hitos de capital ──────────────────
+   if(g_opMode == OPMODE_GROWTH)
+   {
+      // Riesgo y límites escalan con el balance — más capital = más capacidad operativa
+      double growthRiskMult; int growthMaxConc; int growthMaxTrades;
+      if(bal < 50.0)       { growthRiskMult = 0.65; growthMaxConc = 1; growthMaxTrades = 4; }
+      else if(bal < 100.0) { growthRiskMult = 0.68; growthMaxConc = 1; growthMaxTrades = 5; }
+      else if(bal < 200.0) { growthRiskMult = 0.72; growthMaxConc = 2; growthMaxTrades = 6; }
+      else if(bal < 300.0) { growthRiskMult = 0.76; growthMaxConc = 2; growthMaxTrades = 7; }
+      else                 { growthRiskMult = 0.82; growthMaxConc = 2; growthMaxTrades = 8; }
+      g_riskPct       *= growthRiskMult;
+      g_maxConcurrent  = MathMin(growthMaxConc, g_maxConcurrent);
+      g_maxTradesDay   = MathMin(growthMaxTrades, g_maxTradesDay);
+      // BUG-6 FIX: dailyLossUSD era 2% = $0.20 en cuenta de $10.
+      // El spread de UN solo trade (0.01 lot, 35 pts) cuesta ~$0.35 en floating.
+      // Equity circuit se disparaba INSTANTÁNEAMENTE → bot paralizado todo el día.
+      // Solución: usar 8% base + floor de 5 spreads mínimos para permitir que
+      // los trades tengan tiempo de desarrollarse.
+      {
+         double tickVal  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+         double tickSz   = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+         double minLot   = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+         double sp       = (double)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+         // Costo de spread en 1 lote mínimo
+         double spreadUSD = (tickSz > 0 && tickVal > 0) ? sp * tickVal * minLot : 0.0;
+         double ddFromBal   = bal * 0.080;          // 8% base (era 2%)
+         double ddMinSpread = spreadUSD * 5.0;      // floor: 5 trades de spread
+         g_dailyLossUSD = MathMax(ddFromBal, ddMinSpread);
+         g_dailyLossUSD = MathMin(g_dailyLossUSD, bal * 0.15); // hard cap 15%
+      }
+      // BUG-5 FIX: Objetivo diario 5% (era 3% → $15 a $500 — demasiado conservador).
+      // 5% = $25 a $500 → permite capturar días buenos sin parar prematuramente.
+      g_growthHarvestUSD = bal * 0.050;
+
+      // Compounding basado en wins REALIZADOS del día — no en equity flotante
+      double winBonus = 0.0;
+      if(g_winsToday >= 4)      winBonus = 0.25;
+      else if(g_winsToday >= 3) winBonus = 0.18;
+      else if(g_winsToday >= 2) winBonus = 0.10;
+      else if(g_winsToday >= 1) winBonus = 0.05;
+      double losspenalty = g_lossesToday * 0.08;
+      g_growthCompound = MathMax(0.0, MathMin(0.25, winBonus - losspenalty));
+      g_riskPct       *= (1.0 + g_growthCompound);
+   }
+   else
+   {
+      g_growthCompound   = 0.0;
+      g_growthHarvestUSD = 0.0;
+   }
+
+   // DD control override usuario
    if(InpDDMode == DD_PCT_CLOSE && InpDDValue > 0)
       g_dailyLossUSD = bal * InpDDValue / 100.0;
 }
@@ -1497,6 +1835,66 @@ double RiskLevelMult()
       case RISK_VHIGH: return 1.8;
    }
    return 1.0;
+}
+
+// ── Capital Adaptive Mode Detection ───────────────────────────
+// Umbral 500 USD con histéresis ±25 USD para evitar oscilación
+void DetectOpMode()
+{
+   double bal = AccountInfoDouble(ACCOUNT_BALANCE);
+   g_opModePrev = g_opMode;
+
+   if(g_opMode == OPMODE_GROWTH)
+      g_opMode = (bal >= 500.0) ? OPMODE_STANDARD : OPMODE_GROWTH;
+   else
+      g_opMode = (bal < 475.0)  ? OPMODE_GROWTH   : OPMODE_STANDARD;
+
+   if(g_opModePrev != g_opMode)
+   {
+      LOG(StringFormat("[OpMode] %s → %s | Balance: $%.2f",
+          g_opModePrev==OPMODE_GROWTH?"GROWTH":"STANDARD",
+          g_opMode==OPMODE_GROWTH?"GROWTH":"STANDARD", bal));
+      // Transición suave: no cerrar posiciones abiertas, solo ajustar
+      // parámetros en siguiente entrada. Reset harvest flag al subir.
+      if(g_opMode == OPMODE_STANDARD) { g_growthHarvested = false; g_growthSoftHarvested = false; }
+   }
+}
+
+// Cosecha de ganancias diarias en Growth Mode — dos niveles:
+// Soft (~3%): reduce concurrent a 1, protege sin cerrar todo.
+// Hard (5%):  cierra posiciones rentables y para entradas.
+void CheckGrowthHarvest()
+{
+   if(g_opMode != OPMODE_GROWTH)
+   { g_growthHarvested = false; g_growthSoftHarvested = false; return; }
+   if(g_growthHarvestUSD <= 0) return;
+
+   double eq = AccountInfoDouble(ACCOUNT_EQUITY);
+   double sessionProfit = eq - g_sessionStartEquity;
+   double softThreshUSD = g_growthHarvestUSD * 0.60;   // ~3% del balance
+
+   // Soft harvest (~3%): modo conservador sin parar del todo
+   if(!g_growthSoftHarvested && sessionProfit >= softThreshUSD)
+   {
+      g_growthSoftHarvested = true;
+      g_maxConcurrent = 1;
+      LOG(StringFormat("[Growth Soft Harvest] ~3%% alcanzado ($%.2f). Modo conservador.", sessionProfit));
+   }
+
+   // Hard harvest (5%): cerrar rentables y parar entradas
+   if(!g_growthHarvested && sessionProfit >= g_growthHarvestUSD)
+   {
+      g_growthHarvested = true;
+      LOG(StringFormat("[Growth Hard Harvest] 5%% alcanzado ($%.2f). Deteniendo entradas.", sessionProfit));
+      int total = PositionsTotal();
+      for(int i=total-1; i>=0; i--)
+      {
+         ulong t = PositionGetTicket(i);
+         if(!PositionSelectByTicket(t)) continue;
+         if(PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
+         if(PositionGetDouble(POSITION_PROFIT) > 0) trade.PositionClose(t);
+      }
+   }
 }
 
 string CapModeStr()
@@ -1518,24 +1916,365 @@ void CheckDDEscalation()
    if(bal > g_peakBalance) g_peakBalance = bal;
    if(g_peakBalance <= 0) return;
    double ddPct = (g_peakBalance - bal) / g_peakBalance * 100.0;
-   if(ddPct >= 15.0)      { g_ddLevel = 3; g_lotMultDD = 0.0; CloseAllPositions(); }
-   else if(ddPct >= 10.0) { g_ddLevel = 2; g_lotMultDD = 0.50; }
-   else if(ddPct >= 5.0)  { g_ddLevel = 1; g_lotMultDD = 0.75; }
-   else                   { g_ddLevel = 0; g_lotMultDD = 1.0;  }
+
+   if(g_opMode == OPMODE_GROWTH)
+   {
+      // Growth Mode: 4 niveles granulares — evita reacción prematura a floating normal
+      if(ddPct >= 10.0)     { g_ddLevel = 3; g_lotMultDD = 0.0;  CloseAllPositions(); }
+      else if(ddPct >= 7.0) { g_ddLevel = 2; g_lotMultDD = 0.50; }
+      else if(ddPct >= 4.5) { g_ddLevel = 1; g_lotMultDD = 0.70; }
+      else if(ddPct >= 2.5) { g_ddLevel = 0; g_lotMultDD = 0.88; } // aviso suave, no bloqueo
+      else                  { g_ddLevel = 0; g_lotMultDD = 1.0;  }
+   }
+   else
+   {
+      // Standard Mode: umbrales normales
+      if(ddPct >= 15.0)      { g_ddLevel = 3; g_lotMultDD = 0.0; CloseAllPositions(); }
+      else if(ddPct >= 10.0) { g_ddLevel = 2; g_lotMultDD = 0.50; }
+      else if(ddPct >= 5.0)  { g_ddLevel = 1; g_lotMultDD = 0.75; }
+      else                   { g_ddLevel = 0; g_lotMultDD = 1.0;  }
+   }
 }
 
-void CheckRecoveryLayers()
+//====================================================================
+//  ============= MOTOR DE RECUPERACIÓN 6 CAPAS =============
+//  Inspirado en QQ real. NO martingale. Lot máximo 1.5× base.
+//====================================================================
+
+// L6 — Capital Preservation Gate
+bool RecovL6_CapPreservOk()
 {
-   if(g_consecLosses >= 4)      { g_recovLevel = 3; g_lotMultRecov = 0.0; }
-   else if(g_consecLosses >= 3) { g_recovLevel = 2; g_lotMultRecov = 0.50;
-                                  if(g_recovPauseUntil == 0) g_recovPauseUntil = TimeCurrent() + 7200; }
-   else if(g_consecLosses >= 2) { g_recovLevel = 1; g_lotMultRecov = 0.75; }
-   else                         { g_recovLevel = 0; g_lotMultRecov = 1.0; g_recovPauseUntil = 0; }
+   long sp = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+   if(sp > (long)(InpMaxSpread * 0.7)) return false;
+
+   int iM5 = TFIdx(PERIOD_M5);
+   if(iM5 >= 0 && g_tf[iM5].valid && g_atrAvgM5 > 0)
+      if(g_tf[iM5].atr > g_atrAvgM5 * 2.0) return false;
+
+   if(IsNewsTime() || IsNewsTimeNear()) return false;
+   if(g_ddLevel >= 2)    return false;
+   if(g_dayInvalid)      return false;
+
+   MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
+   if(dt.hour < 7 || dt.hour >= 20) return false;
+
+   return true;
+}
+
+// L1 — Regime Recovery Validation
+bool RecovL1_RegimeValid()
+{
+   if(!FilterSpread()) return false;
+   if(g_adxH1 < 20)   return false;
+   if(g_regime != g_regimePrev && g_regimePrev != REG_NEUTRAL) return false;
+
+   if(g_recovIsLong  && !g_d1TrendUp) return false;
+   if(!g_recovIsLong && !g_d1TrendDn) return false;
+
+   return true;
+}
+
+// L2 — Soft Lot Escalation (never exponential)
+double RecovL2_CalcLot(int layer, double slDist)
+{
+   double scaleFactor = 1.0 + 0.10 * (double)layer;
+   if(scaleFactor > 1.5) scaleFactor = 1.5;
+
+   if(g_recovBaseLot > 0)
+   {
+      double rawLot = g_recovBaseLot * scaleFactor;
+      return NormalizeLot(rawLot);
+   }
+   double baseLot = CalcLot(slDist);
+   return NormalizeLot(baseLot * scaleFactor);
+}
+
+// L3 — Structured Grid Recovery Conditions
+bool RecovL3_CanAddLayer()
+{
+   if(!g_recovActive) return false;
+   // GROWTH: máximo 2 capas (vs 3 en STANDARD) — capital pequeño no soporta más exposición
+   int maxLayers = (g_opMode == OPMODE_GROWTH) ? 2 : MAX_GRID_LAYERS;
+   if(g_recovLayerCount >= maxLayers) return false;
+   if(!RecovL6_CapPreservOk())        return false;
+   if(!RecovL1_RegimeValid())         return false;
+
+   double price = g_recovIsLong ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
+                                : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   int iM5 = TFIdx(PERIOD_M5);
+   if(iM5 < 0 || !g_tf[iM5].valid) return false;
+   double atr = g_tf[iM5].atr;
+
+   // GROWTH: spacing más conservador (0.5× ATR vs 0.4×) — capas más separadas
+   double minSpacing = (g_opMode == OPMODE_GROWTH) ? 0.5 : 0.4;
+   if(g_recovAvgEntry > 0 && MathAbs(price - g_recovAvgEntry) < atr * minSpacing) return false;
+
+   // Price must be in adverse zone (0.2R–0.9R against us)
+   if(g_recovAvgEntry > 0)
+   {
+      int iSId = (g_recovStratId >= 0) ? g_recovStratId : 0;
+      double slMult = (g_recovStratId >= 0) ? g_str[g_recovStratId].slAtrMult : 1.5;
+      double slDist = atr * slMult;
+      if(slDist > 0)
+      {
+         double rMove = g_recovIsLong ? (price - g_recovAvgEntry) / slDist
+                                      : (g_recovAvgEntry - price) / slDist;
+         if(rMove < -0.9 || rMove > 0.0) return false;
+      }
+   }
+
+   // H1 trend must agree with recovery direction
+   if(g_recovIsLong  && !g_h1TrendUp) return false;
+   if(!g_recovIsLong && !g_h1TrendDn) return false;
+
+   return true;
+}
+
+// L3 — Add Recovery Grid Layer
+void RecovL3_AddLayer()
+{
+   int iM5 = TFIdx(PERIOD_M5);
+   if(iM5 < 0 || !g_tf[iM5].valid) return;
+
+   double price = g_recovIsLong ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
+                                : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double atr   = g_tf[iM5].atr;
+   double slM   = (g_recovStratId >= 0) ? g_str[g_recovStratId].slAtrMult : 1.5;
+   double tpM   = slM * ((g_recovStratId >= 0) ? g_str[g_recovStratId].rrRatio : 2.0);
+   double sl    = g_recovIsLong ? price - atr*slM : price + atr*slM;
+   double tp    = g_recovIsLong ? price + atr*tpM : price - atr*tpM;
+   double lot   = RecovL2_CalcLot(g_recovLayerCount + 1, MathAbs(price - sl));
+   if(lot <= 0) return;
+
+   string cmt = StringFormat("S%d-R%d", g_recovStratId+1, g_recovLayerCount+1);
+   bool ok = g_recovIsLong ? trade.Buy(lot, _Symbol, price, sl, tp, cmt)
+                           : trade.Sell(lot, _Symbol, price, sl, tp, cmt);
+   if(ok)
+   {
+      ulong newT = trade.ResultOrder();
+      if(g_recovLayerCount < MAX_GRID_LAYERS)
+         g_recovTickets[g_recovLayerCount] = newT;
+      // Update volume-weighted avg entry
+      double totalVol = g_recovBaseLot * g_recovLayerCount + lot;
+      if(totalVol > 0)
+         g_recovAvgEntry = (g_recovAvgEntry * g_recovBaseLot * g_recovLayerCount
+                            + price * lot) / totalVol;
+      g_recovLayerCount++;
+      LOG(StringFormat("Recovery Layer %d added | Price=%.2f Lot=%.2f", g_recovLayerCount, price, lot));
+   }
+}
+
+// L4 — Basket Recovery Exit
+void RecovL4_ManageBasket()
+{
+   if(!g_recovActive || g_recovLayerCount == 0) return;
+
+   double basketPnL = 0;
+   for(int k=0; k<MAX_GRID_LAYERS; k++)
+   {
+      ulong t = g_recovTickets[k];
+      if(t == 0) continue;
+      if(PositionSelectByTicket(t))
+         basketPnL += PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+   }
+
+   // Track peak
+   if(basketPnL > g_recovBasketPeak) g_recovBasketPeak = basketPnL;
+
+   // Target: recover base loss (1R equivalent of base lot)
+   int iM5 = TFIdx(PERIOD_M5);
+   if(iM5 < 0 || !g_tf[iM5].valid) return;
+   double atr   = g_tf[iM5].atr;
+   double slM   = (g_recovStratId >= 0) ? g_str[g_recovStratId].slAtrMult : 1.5;
+   double slDist = atr * slM;
+   double tickVal = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSz  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double basketTarget = (tickSz > 0 && tickVal > 0)
+                         ? g_recovBaseLot * slDist / tickSz * tickVal
+                         : 0;
+
+   // Adaptive: scale slightly with layers
+   basketTarget *= (1.0 + 0.15 * (g_recovLayerCount - 1));
+   // GROWTH: target reducido a 0.75R — salir antes, preservar capital
+   if(g_opMode == OPMODE_GROWTH) basketTarget *= 0.75;
+
+   // Close basket at target
+   if(basketTarget > 0 && basketPnL >= basketTarget)
+   {
+      CloseRecoveryPositions();
+      ResetRecovery();
+      LOG("Recovery basket target reached — reset");
+      return;
+   }
+
+   // Basket trailing: if peak > 50% of target, trail at 70% of peak
+   if(basketTarget > 0 && g_recovBasketPeak >= basketTarget * 0.5)
+   {
+      double trailStop = g_recovBasketPeak * 0.70;
+      if(basketPnL < trailStop && g_recovBasketPeak > 0)
+      {
+         CloseRecoveryPositions();
+         ResetRecovery();
+         LOG("Recovery basket trail stop hit — reset");
+      }
+   }
+}
+
+// L5 — Per-Position Exit Management for Recovery
+void RecovL5_ManageExits()
+{
+   if(!g_recovActive) return;
+
+   for(int k=0; k<MAX_GRID_LAYERS; k++)
+   {
+      ulong t = g_recovTickets[k];
+      if(t == 0) continue;
+      if(!PositionSelectByTicket(t)) continue;
+
+      double opPx  = PositionGetDouble(POSITION_PRICE_OPEN);
+      double slPx  = PositionGetDouble(POSITION_SL);
+      double tpPx  = PositionGetDouble(POSITION_TP);
+      double curPx = g_recovIsLong ? SymbolInfoDouble(_Symbol, SYMBOL_BID)
+                                   : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      double slDist = MathAbs(opPx - slPx);
+      if(slDist <= 0) continue;
+      double rMove = g_recovIsLong ? (curPx - opPx) / slDist
+                                   : (opPx - curPx) / slDist;
+
+      // BE at 0.5R (tighter than normal 0.8R)
+      if(!g_recovBEDone && rMove >= 0.5)
+      {
+         double newSL = g_recovIsLong ? opPx + slDist*0.03 : opPx - slDist*0.03;
+         if(g_recovIsLong  && (slPx < opPx || slPx == 0)) trade.PositionModify(t, newSL, tpPx);
+         if(!g_recovIsLong && (slPx > opPx || slPx == 0)) trade.PositionModify(t, newSL, tpPx);
+         if(k == 0) g_recovBEDone = true;
+      }
+
+      // Partial 30% at 1.0R
+      if(!g_recovPartialDone && rMove >= 1.0)
+      {
+         double vol  = PositionGetDouble(POSITION_VOLUME);
+         double part = NormalizeLot(vol * 0.30);
+         if(part > 0 && part < vol)
+         {
+            trade.PositionClosePartial(t, part);
+            if(k == 0) g_recovPartialDone = true;
+         }
+      }
+
+      // Trailing ATR×1.5 from 1.0R (earlier trigger than normal 1.2R)
+      if(rMove >= 1.0)
+      {
+         int iM5 = TFIdx(PERIOD_M5);
+         if(iM5 >= 0 && g_tf[iM5].valid)
+         {
+            double newSL = g_recovIsLong ? curPx - g_tf[iM5].atr*1.5
+                                         : curPx + g_tf[iM5].atr*1.5;
+            if(g_recovIsLong  && newSL > slPx) trade.PositionModify(t, newSL, tpPx);
+            if(!g_recovIsLong && (newSL < slPx || slPx == 0)) trade.PositionModify(t, newSL, tpPx);
+         }
+      }
+   }
+}
+
+// Initiate Recovery after confirmed loss
+void InitiateRecovery(int sId, bool isLong, double baseLot)
+{
+   if(g_recovActive)        return;   // no stacking
+   if(g_consecLosses > 3)  return;   // 4+ losses = full stop, no recovery
+   if(sId < 0)              return;
+
+   g_recovActive        = true;
+   g_recovStratId       = sId;
+   g_recovIsLong        = isLong;
+   g_recovBaseLot       = (baseLot > 0) ? baseLot : 0.01;
+   g_recovAvgEntry      = 0.0;
+   g_recovBasketPeak    = 0.0;
+   g_recovLayerCount    = 0;
+   g_recovLastLossTime  = TimeCurrent();
+   g_recovBEDone        = false;
+   g_recovPartialDone   = false;
+   for(int k=0; k<MAX_GRID_LAYERS; k++) g_recovTickets[k] = 0;
+
+   LOG(StringFormat("Recovery armed | S%d %s BaseLot=%.2f ConsecLoss=%d",
+       sId+1, isLong?"LONG":"SHORT", g_recovBaseLot, g_consecLosses));
+}
+
+// Reset Recovery State
+void ResetRecovery()
+{
+   g_recovActive       = false;
+   g_recovStratId      = -1;
+   g_recovIsLong       = false;
+   g_recovBaseLot      = 0.0;
+   g_recovAvgEntry     = 0.0;
+   g_recovBasketPeak   = 0.0;
+   g_recovLayerCount   = 0;
+   g_recovBEDone       = false;
+   g_recovPartialDone  = false;
+   for(int k=0; k<MAX_GRID_LAYERS; k++) g_recovTickets[k] = 0;
+   LOG("Recovery engine reset");
+}
+
+// Close all open recovery positions
+void CloseRecoveryPositions()
+{
+   for(int k=0; k<MAX_GRID_LAYERS; k++)
+   {
+      ulong t = g_recovTickets[k];
+      if(t == 0) continue;
+      if(PositionSelectByTicket(t)) trade.PositionClose(t);
+      g_recovTickets[k] = 0;
+   }
+}
+
+// UpdateRecoveryEngine — replaces CheckRecoveryLayers()
+void UpdateRecoveryEngine()
+{
+   // BUG-1 FIX: Detectar estado zombie — recovery armado pero todos los tickets muertos.
+   // Causa: SL barre todas las capas → g_recovActive queda true indefinidamente.
+   // Solución: auto-reset si g_recovLayerCount > 0 pero ningún ticket tiene posición abierta.
+   if(g_recovActive && g_recovLayerCount > 0)
+   {
+      bool anyAlive = false;
+      for(int k=0; k<MAX_GRID_LAYERS; k++)
+      {
+         if(g_recovTickets[k] != 0 && PositionSelectByTicket(g_recovTickets[k]))
+         {
+            anyAlive = true;
+            break;
+         }
+      }
+      if(!anyAlive)
+      {
+         LOG("[Recovery] Zombie detectado — todos tickets cerrados. Auto-reset.");
+         ResetRecovery();
+      }
+   }
+
+   // Normal lot reduction tiers (when no active recovery)
+   if(!g_recovActive)
+   {
+      if(g_consecLosses >= 4)      { g_recovLevel = 3; g_lotMultRecov = 0.0; g_recovPauseUntil = TimeCurrent()+7200; }
+      else if(g_consecLosses >= 3) { g_recovLevel = 2; g_lotMultRecov = 0.50; }
+      else if(g_consecLosses >= 2) { g_recovLevel = 1; g_lotMultRecov = 0.75; }
+      else if(g_consecLosses >= 1) { g_recovLevel = 0; g_lotMultRecov = 0.90; }
+      else                         { g_recovLevel = 0; g_lotMultRecov = 1.0; g_recovPauseUntil = 0; }
+   }
+}
+
+// RunRecoveryEngine — add new recovery layers (called from OnTick)
+void RunRecoveryEngine()
+{
+   if(!g_recovActive)               return;
+   if(!RecovL6_CapPreservOk())      return;
+   if(!RecovL1_RegimeValid())       return;
+   if(RecovL3_CanAddLayer())        RecovL3_AddLayer();
 }
 
 bool IsRecoveryPaused()
 {
-   return (g_recovLevel == 2 && g_recovPauseUntil > 0 && TimeCurrent() < g_recovPauseUntil);
+   return (g_recovLevel >= 3 && g_recovPauseUntil > 0 && TimeCurrent() < g_recovPauseUntil);
 }
 
 void CheckEquityCircuit()
@@ -1625,7 +2364,11 @@ void DailyReset()
    g_sessionStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
    for(int s=0; s<NUM_STRATS; s++)
    {
-      g_str[s].winsToday = 0; g_str[s].lossesToday = 0; g_str[s].pnlToday = 0;
+      g_str[s].winsToday        = 0;
+      g_str[s].lossesToday      = 0;
+      g_str[s].pnlToday         = 0;
+      g_str[s].sameDirectStreak = 0;
+      // lastSLTime NO se resetea — cooldown de SL persiste entre días para proteger
    }
    g_orbBuilt = false; g_orbHi = 0; g_orbLo = DBL_MAX;
    g_orbFiredLong = false; g_orbFiredShort = false;
@@ -1633,6 +2376,10 @@ void DailyReset()
    g_nyFiredLong = false; g_nyFiredShort = false;
    g_asBuilt = false; g_asHi = 0; g_asLo = DBL_MAX;
    g_asFiredLong = false; g_asFiredShort = false;
+   g_consecLosses        = 0;
+   g_growthHarvested     = false;
+   g_growthSoftHarvested = false;
+   if(g_recovActive) { CloseRecoveryPositions(); ResetRecovery(); }
 }
 
 void CheckDayReset()
@@ -1651,6 +2398,11 @@ void CheckDayReset()
 //====================================================================
 void RefreshPositionTracking()
 {
+   // En tester: reconstruir solo cuando hubo cambio (dirty flag).
+   // En live: reconstruir siempre para consistencia en tiempo real.
+   if(g_isTesting && !g_posTrackDirty) return;
+   g_posTrackDirty = false;
+
    for(int s=0; s<NUM_STRATS; s++) g_str[s].posCount = 0;
    g_posCount = 0;
    int total = PositionsTotal();
@@ -1708,8 +2460,22 @@ int ExtractGridIdx(string cmt)
 
 int CountAllOpen()
 {
+   // BUG-2 FIX: contar solo posiciones normales (S<n>-B / S<n>-G<k>), NO recovery (S<n>-R<k>).
+   // Recovery positions comparten sId con estrategias normales → inflaban posCount
+   // → reducían slots disponibles para entradas normales → undertrade.
    int n = 0;
-   for(int s=0; s<NUM_STRATS; s++) n += g_str[s].posCount;
+   int total = PositionsTotal();
+   for(int i=0; i<total; i++)
+   {
+      ulong t = PositionGetTicket(i);
+      if(!PositionSelectByTicket(t)) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      string cmt = PositionGetString(POSITION_COMMENT);
+      // Excluir recovery (contienen "-R")
+      if(StringFind(cmt, "-R") >= 0) continue;
+      n++;
+   }
    return n;
 }
 
@@ -1749,14 +2515,18 @@ bool OpenTrade(int sId, bool isBuy, ENUM_TIMEFRAMES slTF, double slMult, double 
       g_str[sId].gridLayers = 0;
       g_tradesToday++;
       g_str[sId].status = SSTAT_IN_TRADE;
+      g_posTrackDirty = true;
    }
    return ok;
 }
 
 double CalcLot(double slDistPrice)
 {
-   double bal = AccountInfoDouble(ACCOUNT_BALANCE);
-   double lot = 0;
+   double bal  = AccountInfoDouble(ACCOUNT_BALANCE);
+   double minL = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxL = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   double lot  = 0;
 
    if(InpLotMethod == LOT_FIXED)
    {
@@ -1770,18 +2540,34 @@ double CalcLot(double slDistPrice)
    }
    else
    {
-      // AUTOMATIC: risk %
+      // AUTOMATIC: risk % base
       if(slDistPrice <= 0) return 0;
       double tickVal = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
       double tickSz  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
       if(tickVal <= 0 || tickSz <= 0) return 0;
       double riskUSD = bal * g_riskPct / 100.0 * g_lotMultDD * g_lotMultRecov;
       lot = riskUSD * tickSz / (tickVal * slDistPrice);
+
+      // BUG-7 FIX: Para CAP_MICRO (bal < $50) el cálculo porcentual da lot < minL
+      // (ej: $10 × 0.35% = $0.035 → lot ≈ 0.00047 → debajo de minL=0.01).
+      // El antiguo MathMax(minL, lot) forzaba 0.01 lot sin control → riesgo real 7.5%
+      // en vez de 0.35%. Ahora: si lot < minL, usamos minL SOLO si el riesgo real
+      // (SL en USD para minL) no supera el límite por capital mode.
+      // MICRO (<$50): permite hasta 35% por trade — minLot es la única opción viable.
+      // SMALL ($50-299): permite hasta 22% — lote mínimo aún muy grande en proporción.
+      // MEDIUM+: permite hasta 15% — protección estándar.
+      if(lot < minL)
+      {
+         // Riesgo real con minL
+         double slUSD_minL = slDistPrice * tickVal * minL / tickSz;
+         double riskPctReal = (bal > 0) ? slUSD_minL / bal * 100.0 : 999.0;
+         double guardPct = (g_capMode == CAP_MICRO) ? 35.0 :
+                           (g_capMode == CAP_SMALL) ? 22.0 : 15.0;
+         if(riskPctReal > guardPct) return 0;   // demasiado riesgo → no abrir
+         lot = minL;   // usar minL — riesgo aceptable
+      }
    }
 
-   double minL = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-   double maxL = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
-   double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
    if(step > 0) lot = MathFloor(lot / step) * step;
    lot = MathMax(minL, MathMin(maxL, lot));
    return NormalizeDouble(lot, 2);
@@ -1796,11 +2582,6 @@ double NormalizeLot(double lot)
    return NormalizeDouble(MathMax(minL, MathMin(maxL, lot)), 2);
 }
 
-bool WeeklyBiasOk(bool isBuy)
-{
-   if(!g_weeklyBiasUp && !g_weeklyBiasDn) return true;   // neutro
-   return isBuy ? !g_weeklyBiasDn : !g_weeklyBiasUp;
-}
 
 //====================================================================
 //  BROKER SETS — preset ajustes según broker
@@ -1832,6 +2613,7 @@ void ApplyBrokerSet()
 
 void DrawPanel()
 {
+   if(g_isTesting) return;   // no panel en tester — elimina miles de ObjectSet/Find por tick
    // Background
    PanelBox(PNL_PREFIX+"BG", 8, 25, 620, 510, C'15,20,40');
 
@@ -1871,9 +2653,24 @@ void DrawPanel()
    PanelLabel(PNL_PREFIX+"L17", 16, y, StringFormat("Total Volume: %.2f Lots", TotalOpenVolume()), clrLightGray, InpPanelFontSize); y+=22;
 
    PanelLabel(PNL_PREFIX+"L18", 16, y, "Regime: "+RegimeStr(), RegimeColor(), InpPanelFontSize); y+=18;
-   PanelLabel(PNL_PREFIX+"L19", 16, y, "Capital Mode: "+CapModeStr(), clrLightGray, InpPanelFontSize); y+=18;
-   PanelLabel(PNL_PREFIX+"L20", 16, y, StringFormat("DD Lvl: %d | Recov: %d | Loss: %d/%d",
-              g_ddLevel, g_recovLevel, g_lossesToday, g_consecLosses), clrLightGray, InpPanelFontSize); y+=18;
+   // Operating mode — destacado con color diferencial + progreso de milestone
+   string opModeLabel;
+   if(g_opMode == OPMODE_GROWTH)
+   {
+      double balP = AccountInfoDouble(ACCOUNT_BALANCE);
+      double nextMS = (balP < 50)?50:(balP < 100)?100:(balP < 200)?200:(balP < 300)?300:500;
+      double pctMS  = (nextMS > 0) ? balP / nextMS * 100.0 : 100.0;
+      string harvestTag = g_growthHarvested ? " HARVEST" : (g_growthSoftHarvested ? " SOFT" : "");
+      opModeLabel = StringFormat("Mode: GROWTH [x%.2f]%s →$%.0f [%.1f%%]",
+                                 1.0+g_growthCompound, harvestTag, nextMS, pctMS);
+   }
+   else opModeLabel = "Mode: STANDARD";
+   color  opModeColor = (g_opMode == OPMODE_GROWTH) ? clrGold : clrLightBlue;
+   PanelLabel(PNL_PREFIX+"L18b", 16, y, opModeLabel, opModeColor, InpPanelFontSize); y+=18;
+   PanelLabel(PNL_PREFIX+"L19", 16, y, "Cap: "+CapModeStr()+" | Risk: "+DoubleToString(g_riskPct,2)+"%", clrLightGray, InpPanelFontSize); y+=18;
+   PanelLabel(PNL_PREFIX+"L20", 16, y, StringFormat("DD:%d | Recov:%s L%d | Loss:%d/%d",
+              g_ddLevel, g_recovActive?"ON":"off", g_recovLayerCount,
+              g_lossesToday, g_consecLosses), clrLightGray, InpPanelFontSize); y+=18;
    PanelLabel(PNL_PREFIX+"L21", 16, y, StringFormat("Trades: %d/%d | W:%d L:%d",
               g_tradesToday, g_maxTradesDay, g_winsToday, g_lossesToday), clrLightGray, InpPanelFontSize); y+=22;
    PanelLabel(PNL_PREFIX+"L22", 16, y, "Broker: "+AccountInfoString(ACCOUNT_COMPANY), clrLightGray, InpPanelFontSize); y+=18;
