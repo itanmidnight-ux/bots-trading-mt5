@@ -916,11 +916,13 @@ bool HasStructuralBreak(ENUM_TIMEFRAMES tf, bool isBuy, int swingLookback=10)
 }
 
 // Weekly Bias — W1 EMA10 dirección para filtrar entradas contra tendencia semanal.
-// Aplica en ambos modos. GROWTH usa D1 + W1 para máxima protección en cuentas pequeñas.
+// Aplica en GROWTH non-MICRO y STANDARD. MICRO omite este filtro para maximizar entradas.
 // Calcula EMA10 W1 dinámicamente: compara close W1[1] vs EMA10 W1[1].
 // Retorna true si el trade está a favor del sesgo semanal (o si no hay sesgo claro).
 bool WeeklyBiasOk(bool isBuy)
 {
+   // MICRO necesita máxima oportunidad — omitir filtro W1
+   if(g_opMode == OPMODE_GROWTH && g_capMode == CAP_MICRO) return true;
    double wEMA10[1];
    if(hW1EMA10 == INVALID_HANDLE) return true;  // handle no disponible — no bloquear
    if(CopyBuffer(hW1EMA10, 0, 1, 1, wEMA10) <= 0) return true;
@@ -937,17 +939,17 @@ bool WeeklyBiasOk(bool isBuy)
 }
 
 // Pipeline maestro: combina los 3 filtros estructurales.
-// GROWTH: todos los sub-modos exigen D1 alignment.
-// MICRO en GROWTH: omite strike (SL grande en % ya protege), pero SÍ exige D1.
+// GROWTH non-MICRO: exige D1 alignment + strike.
+// MICRO en GROWTH: omite strike Y D1 — capital <$50 necesita máxima oportunidad de entrada.
 bool ConfirmEntry(ENUM_TIMEFRAMES tf, bool isBuy, bool strikeRequired=true)
 {
    if(!HasCandleConfirmation(tf, isBuy)) return false;
-   // MICRO omite strike — SL ya es proporcional al capital pequeño
    bool microGrowth = (g_opMode == OPMODE_GROWTH && g_capMode == CAP_MICRO);
+   // Strike: MICRO lo omite, no-MICRO GROWTH lo exige siempre
    bool needStrike  = strikeRequired || (g_opMode == OPMODE_GROWTH && !microGrowth);
    if(needStrike && !HasStrikeConfirmation(tf, isBuy)) return false;
-   // D1 alignment: TODOS en GROWTH lo exigen (MICRO incluido — un trade contra D1 es catastrófico en cuenta pequeña)
-   if(g_opMode == OPMODE_GROWTH)
+   // D1 alignment: GROWTH non-MICRO lo exige; MICRO lo omite (prioridad: obtener trades)
+   if(g_opMode == OPMODE_GROWTH && !microGrowth)
    {
       if(isBuy  && !g_d1TrendUp) return false;
       if(!isBuy && !g_d1TrendDn) return false;
@@ -1022,9 +1024,10 @@ bool CheckEntryQuality(int sId, bool isBuy)
       bool c3 = isBuy ? (g_tf[iM5].closeNow > g_tf[iM5].openNow)
                        : (g_tf[iM5].closeNow < g_tf[iM5].openNow);
       int agree = (c1?1:0) + (c2?1:0) + (c3?1:0);
-      // GROWTH: exige 2/3 velas M5 en dirección (mayor win rate)
-      // STANDARD: basta 1/3 (más permisivo para breakouts)
-      int minAgree = (g_opMode == OPMODE_GROWTH) ? 2 : 1;
+      // GROWTH non-MICRO: exige 2/3 velas M5 (mayor win rate)
+      // MICRO o STANDARD: basta 1/3 — MICRO necesita máxima oportunidad de entrada
+      bool isMicroGrowth = (g_opMode == OPMODE_GROWTH && g_capMode == CAP_MICRO);
+      int minAgree = (g_opMode == OPMODE_GROWTH && !isMicroGrowth) ? 2 : 1;
       if(agree < minAgree) return false;
    }
 
@@ -1131,18 +1134,22 @@ void RunActiveStrategies()
       // Growth Mode: filtros adicionales de calidad
       if(g_opMode == OPMODE_GROWTH)
       {
-         // ADX≥28 para estrategias trend
+         // ADX≥28 para estrategias trend (no MICRO — MICRO necesita máxima oportunidad)
          bool isTrendStrat = (s==0||s==1||s==6||s==10);
-         if(isTrendStrat && g_adxH1 < 28) { MarkStratBarConsumed(s); continue; }
+         if(isTrendStrat && g_capMode != CAP_MICRO && g_adxH1 < 28) { MarkStratBarConsumed(s); continue; }
 
-         // Filtro de sesión alta probabilidad:
+         // Filtro de sesión alta probabilidad (solo non-MICRO):
          // HIGH: London 08-11 GMT + NY 13:30-17 GMT → todas las estrategias elegibles
          // LOW (resto): solo estrategias con gate de sesión propio (S3,S4,S5,S8)
-         MqlDateTime dtG; TimeToStruct(TimeCurrent(), dtG);
-         int hG = dtG.hour, hmG = hG*60 + dtG.min;
-         bool highSession = (hG >= 8 && hG < 11) || (hmG >= 13*60+30 && hmG < 17*60);
-         bool isSessionGated = (s==2||s==3||s==4||s==7); // S3,S4,S5,S8 gestionan su sesión
-         if(!highSession && !isSessionGated) { MarkStratBarConsumed(s); continue; }
+         // MICRO omite este filtro — prioridad es obtener trades, no calidad de sesión
+         if(g_capMode != CAP_MICRO)
+         {
+            MqlDateTime dtG; TimeToStruct(TimeCurrent(), dtG);
+            int hG = dtG.hour, hmG = hG*60 + dtG.min;
+            bool highSession = (hG >= 8 && hG < 11) || (hmG >= 13*60+30 && hmG < 17*60);
+            bool isSessionGated = (s==2||s==3||s==4||s==7); // S3,S4,S5,S8 gestionan su sesión
+            if(!highSession && !isSessionGated) { MarkStratBarConsumed(s); continue; }
+         }
       }
 
       // Si tiene posición base, solo entra como grid layer
@@ -2548,23 +2555,25 @@ double CalcLot(double slDistPrice)
       double riskUSD = bal * g_riskPct / 100.0 * g_lotMultDD * g_lotMultRecov;
       lot = riskUSD * tickSz / (tickVal * slDistPrice);
 
-      // BUG-7 FIX: Para CAP_MICRO (bal < $50) el cálculo porcentual da lot < minL
-      // (ej: $10 × 0.35% = $0.035 → lot ≈ 0.00047 → debajo de minL=0.01).
-      // El antiguo MathMax(minL, lot) forzaba 0.01 lot sin control → riesgo real 7.5%
-      // en vez de 0.35%. Ahora: si lot < minL, usamos minL SOLO si el riesgo real
-      // (SL en USD para minL) no supera el límite por capital mode.
-      // MICRO (<$50): permite hasta 35% por trade — minLot es la única opción viable.
-      // SMALL ($50-299): permite hasta 22% — lote mínimo aún muy grande en proporción.
-      // MEDIUM+: permite hasta 15% — protección estándar.
+      // Para CAP_MICRO (bal < $50) el cálculo porcentual da lot < minL.
+      // MICRO: siempre usar minLot — es la única opción viable, sin guardPct.
+      //   Razón: con $10-$49, minLot=0.01 es literalmente el lote más pequeño posible.
+      //   Rechazar el trade significa 0 operaciones. Aceptar minLot da oportunidad de crecer.
+      // SMALL/MEDIUM+: guardia proporcional para evitar riesgo excesivo accidental.
       if(lot < minL)
       {
-         // Riesgo real con minL
-         double slUSD_minL = slDistPrice * tickVal * minL / tickSz;
-         double riskPctReal = (bal > 0) ? slUSD_minL / bal * 100.0 : 999.0;
-         double guardPct = (g_capMode == CAP_MICRO) ? 35.0 :
-                           (g_capMode == CAP_SMALL) ? 22.0 : 15.0;
-         if(riskPctReal > guardPct) return 0;   // demasiado riesgo → no abrir
-         lot = minL;   // usar minL — riesgo aceptable
+         if(g_capMode == CAP_MICRO)
+         {
+            lot = minL;   // MICRO: siempre minLot sin restricción de guardPct
+         }
+         else
+         {
+            double slUSD_minL = slDistPrice * tickVal * minL / tickSz;
+            double riskPctReal = (bal > 0) ? slUSD_minL / bal * 100.0 : 999.0;
+            double guardPct = (g_capMode == CAP_SMALL) ? 22.0 : 15.0;
+            if(riskPctReal > guardPct) return 0;   // demasiado riesgo → no abrir
+            lot = minL;
+         }
       }
    }
 
