@@ -149,7 +149,7 @@ const string gTFNames[NUM_TFS] = {
 
 // ── Capital floors & confidence thresholds ──────────────────────────────
 #define MIN_CAPITAL_USD      9.50   // Hard floor live: refuse to operate below
-#define CONF_THRESH_MICRO   70.0   // Scoring gate: GROWTH + CAP_MICRO
+#define CONF_THRESH_MICRO   75.0   // Scoring gate: GROWTH + CAP_MICRO — alta precisión
 #define CONF_THRESH_SMALL   62.0   // Scoring gate: GROWTH + CAP_SMALL/MEDIUM
 #define CONF_THRESH_STD     50.0   // Scoring gate: STANDARD mode
 
@@ -980,10 +980,14 @@ void ActivateStrategies()
 
       if(g_capMode == CAP_MICRO)
       {
-         // <$50: solo 3 estrategias de máxima precisión con sesión controlada
-         allowed[0] = true;   // S1  Trend Follow M5
+         // <$50: únicamente estrategias de alta precisión con sesión controlada y sin grid
+         // S3 London ORB  — breakout one-shot, ventana 07-10 GMT definida
+         // S4 NY Session  — breakout one-shot, ventana 13:30-17 GMT, MFI+RSI confirmados
+         // S8 PDH/PDL     — niveles estructurales D1, ventana 07-15 GMT, sin grid
+         // S1 ELIMINADA   — grid habilitado + condiciones EMA multi-TF frágiles en micro
          allowed[2] = true;   // S3  London ORB
          allowed[3] = true;   // S4  NY Session
+         allowed[7] = true;   // S8  PDH/PDL Breakout
       }
       else if(g_capMode == CAP_SMALL)
       {
@@ -1269,6 +1273,7 @@ bool CheckEntryQuality(int sId, bool isBuy)
 // + price movido al menos ATR×0.4 desde última capa (spacing dinámico).
 bool CanAddGridLayer(int sId, bool isBuy)
 {
+   if(g_capMode == CAP_MICRO) return false;  // Sin grid stacking en micro-capital
    if(!g_str[sId].gridEnabled) return false;
    if(g_str[sId].posCount == 0) return false;
    if(g_str[sId].gridLayers >= MAX_GRID_LAYERS - 1) return false;
@@ -1313,7 +1318,11 @@ bool EnterOrStackPosition(int sId, bool isBuy)
       if(!CheckEntryQuality(sId, isBuy)) return false;
       // Apertura base — usa RR y SL configurados en state struct
       double slMult = g_str[sId].slAtrMult;
-      double tpMult = slMult * g_str[sId].rrRatio;
+      double rrBase = g_str[sId].rrRatio;
+      // MICRO: RR mínimo 2.0R para S3/S4/S8 — ganancias reales que justifican el riesgo
+      if(g_capMode == CAP_MICRO && (sId==2||sId==3||sId==7))
+         rrBase = MathMax(rrBase, 2.0);
+      double tpMult = slMult * rrBase;
       return OpenTrade(sId, isBuy, g_str[sId].entryTF, slMult, tpMult);
    }
    else
@@ -1355,15 +1364,17 @@ void RunActiveStrategies()
       // Growth Mode: filtros adicionales de calidad
       if(g_opMode == OPMODE_GROWTH)
       {
-         // ADX≥28 para estrategias trend (no MICRO — MICRO necesita máxima oportunidad)
+         // ADX≥28 para estrategias trend; MICRO: ADX≥18 como piso mínimo de estructura
          bool isTrendStrat = (s==0||s==1||s==6||s==10);
-         if(isTrendStrat && g_capMode != CAP_MICRO && g_adxH1 < 28) { MarkStratBarConsumed(s); continue; }
+         int adxFloor = (g_capMode == CAP_MICRO) ? 18 : 28;
+         if(isTrendStrat && g_adxH1 < adxFloor) { MarkStratBarConsumed(s); continue; }
+         // MICRO: mercado muerto (ADX<15) = no operar nada, spread mata cualquier ganancia
+         if(g_capMode == CAP_MICRO && g_adxH1 < 15) { MarkStratBarConsumed(s); continue; }
 
-         // Filtro de sesión alta probabilidad (solo non-MICRO):
+         // Filtro de sesión alta probabilidad — aplica a TODOS los modos:
          // HIGH: London 08-11 GMT + NY 13:30-17 GMT → todas las estrategias elegibles
          // LOW (resto): solo estrategias con gate de sesión propio (S3,S4,S5,S8)
-         // MICRO omite este filtro — prioridad es obtener trades, no calidad de sesión
-         if(g_capMode != CAP_MICRO)
+         // S3,S4,S8 (whitelist MICRO) tienen sus propias ventanas → pasan siempre
          {
             MqlDateTime dtG; TimeToStruct(TimeCurrent(), dtG);
             int hG = dtG.hour, hmG = hG*60 + dtG.min;
@@ -1491,14 +1502,16 @@ bool TryS3_LondonORB()
    if(!g_orbBuilt) return false;
    if(dt.hour > 10) return false;
 
-   double buf = g_tf[iM5].atr * 0.15;
+   double buf = g_tf[iM5].atr * 0.10;  // 0.15→0.10: entrada más cercana al nivel
    double cl1 = g_tf[iM5].close1;
    bool breakUp = !g_orbFiredLong  && cl1 > g_orbHi + buf
                   && g_tf[iM5].close1 > g_tf[iM5].open1
-                  && g_tf[iM5].ema9 > g_tf[iM5].ema21;
+                  && g_tf[iM5].ema9 > g_tf[iM5].ema21
+                  && g_tf[iM5].mfi > 52;  // confirmación de volumen comprador
    bool breakDn = !g_orbFiredShort && cl1 < g_orbLo - buf
                   && g_tf[iM5].close1 < g_tf[iM5].open1
-                  && g_tf[iM5].ema9 < g_tf[iM5].ema21;
+                  && g_tf[iM5].ema9 < g_tf[iM5].ema21
+                  && g_tf[iM5].mfi < 48;  // confirmación de volumen vendedor
 
    if(breakUp && ConfirmEntry(PERIOD_M5, true, false))
       { g_orbFiredLong  = true; return EnterOrStackPosition(2, true);  }
@@ -1663,10 +1676,19 @@ bool TryS8_PDHPDLBreak()
    double pdl = iLow(_Symbol,  PERIOD_D1, 1);
    int iM15 = TFIdx(PERIOD_M15); if(iM15<0 || !g_tf[iM15].valid) return false;
 
+   // Ventana operativa 07-15 GMT — PDH/PDL relevantes en sesión europea/NY
+   MqlDateTime dtS8; TimeToStruct(TimeCurrent(), dtS8);
+   if(dtS8.hour < 7 || dtS8.hour >= 15) return false;
+
    double cl1 = g_tf[iM15].close1;
    double buf = g_tf[iM15].atr * 0.15;
-   bool brkUp = cl1 > pdh + buf && g_tf[iM15].close1 > g_tf[iM15].open1 && g_tf[iM15].rsi > 50;
-   bool brkDn = cl1 < pdl - buf && g_tf[iM15].close1 < g_tf[iM15].open1 && g_tf[iM15].rsi < 50;
+   // GROWTH mode: exige alineación D1 — solo operar en dirección del trend diario
+   bool brkUp = cl1 > pdh + buf && g_tf[iM15].close1 > g_tf[iM15].open1
+                && g_tf[iM15].rsi > 52
+                && (g_opMode != OPMODE_GROWTH || g_d1TrendUp);
+   bool brkDn = cl1 < pdl - buf && g_tf[iM15].close1 < g_tf[iM15].open1
+                && g_tf[iM15].rsi < 48
+                && (g_opMode != OPMODE_GROWTH || g_d1TrendDn);
 
    if(brkUp && ConfirmEntry(PERIOD_M15, true, false))   return EnterOrStackPosition(7, true);
    if(brkDn && ConfirmEntry(PERIOD_M15, false, false))  return EnterOrStackPosition(7, false);
@@ -1850,8 +1872,8 @@ void ManagePositions()
       if(posOpenTime >= curM1Bar) continue;
 
       // ── 1. Break-even adaptativo ──────────────────────────────────
-      // GROWTH MICRO: BE más temprano (0.6R) para proteger microganancias
-      double beTrigger = (g_opMode == OPMODE_GROWTH && g_capMode == CAP_MICRO) ? 0.60 : 0.80;
+      // GROWTH MICRO: BE a 0.40R — proteger micro-ganancias tan pronto como sea seguro
+      double beTrigger = (g_opMode == OPMODE_GROWTH && g_capMode == CAP_MICRO) ? 0.40 : 0.80;
       if(rMove >= beTrigger)
       {
          double newSL = isLong ? opPx + slDist*0.05 : opPx - slDist*0.05;
@@ -1861,8 +1883,9 @@ void ManagePositions()
 
       // ── 2. Cierre parcial adaptativo ─────────────────────────────
       bool isGridLayer = StringFind(PositionGetString(POSITION_COMMENT), "-G") >= 0;
-      double partialTrigger = (g_opMode == OPMODE_GROWTH && g_capMode == CAP_MICRO) ? 0.80 : 1.00;
-      double partialPct     = (g_opMode == OPMODE_GROWTH && g_capMode == CAP_MICRO) ? 0.40 : 0.50;
+      // MICRO: cerrar 30% a 0.50R — asegurar ganancias antes que velen el movimiento
+      double partialTrigger = (g_opMode == OPMODE_GROWTH && g_capMode == CAP_MICRO) ? 0.50 : 1.00;
+      double partialPct     = (g_opMode == OPMODE_GROWTH && g_capMode == CAP_MICRO) ? 0.30 : 0.50;
       if(!isGridLayer && rMove >= partialTrigger && !IsPartialDone(t, 1))
       {
          double vol  = PositionGetDouble(POSITION_VOLUME);
@@ -1909,6 +1932,25 @@ void ManagePositions()
       if(barsOpen > maxMin && rMove < 0.5)
       {
          trade.PositionClose(t);
+         continue;
+      }
+
+      // ── 5. ORB invalidation exit (MICRO) ─────────────────────────
+      // Si el precio regresa dentro del rango ORB/NY y no hemos llegado a 0.5R,
+      // el breakout era falso → salir antes de perder el SL completo.
+      if(g_capMode == CAP_MICRO && (sId == 2 || sId == 3))
+      {
+         int iM5orb = TFIdx(PERIOD_M5);
+         if(iM5orb >= 0 && g_tf[iM5orb].valid)
+         {
+            double rangeLo = (sId == 2) ? g_orbLo : g_nyLo;
+            double rangeHi = (sId == 2) ? g_orbHi : g_nyHi;
+            double atrOrb  = g_tf[iM5orb].atr;
+            // Precio regresó dentro del rango (± buffer ATR×0.3)
+            bool returnedInside = isLong  ? (curPx < rangeHi + atrOrb*0.30)
+                                          : (curPx > rangeLo - atrOrb*0.30);
+            if(returnedInside && rMove < 0.5) { trade.PositionClose(t); continue; }
+         }
       }
    }
 
@@ -1917,17 +1959,18 @@ void ManagePositions()
 
 int StratMaxMinutes(int sId)
 {
-   // Estrategias de mayor TF → más tiempo
+   bool micro = (g_opMode == OPMODE_GROWTH && g_capMode == CAP_MICRO);
+   // Estrategias de mayor TF → más tiempo; MICRO: timeouts reducidos para no aguantar perdedores
    switch(sId)
    {
       case 0: return 240;    // S1 M5
       case 1: return 480;    // S2 H1
-      case 2: return 180;    // S3 ORB M5
-      case 3: return 180;    // S4 NY M5
+      case 2: return micro ?  90 : 180;   // S3 ORB: 90 min MICRO, 180 normal
+      case 3: return micro ?  90 : 180;   // S4 NY:  90 min MICRO, 180 normal
       case 4: return 240;    // S5 Asia M5
       case 5: return 90;     // S6 BB M5
       case 6: return 600;    // S7 H1
-      case 7: return 240;    // S8 PDH M15
+      case 7: return micro ? 120 : 240;   // S8 PDH: 120 min MICRO, 240 normal
       case 8: return 240;    // S9 M15
       case 9: return 180;    // S10 M15
       case 10: return 480;   // S11 H1
@@ -2033,7 +2076,7 @@ void DetectCapitalMode()
    {
       // Riesgo y límites escalan con el balance — más capital = más capacidad operativa
       double growthRiskMult; int growthMaxConc; int growthMaxTrades;
-      if(bal < 50.0)       { growthRiskMult = 0.65; growthMaxConc = 1; growthMaxTrades = 4; }
+      if(bal < 50.0)       { growthRiskMult = 0.65; growthMaxConc = 1; growthMaxTrades = 2; }  // MICRO: máx 2 trades/día — calidad sobre cantidad
       else if(bal < 100.0) { growthRiskMult = 0.68; growthMaxConc = 1; growthMaxTrades = 5; }
       else if(bal < 200.0) { growthRiskMult = 0.72; growthMaxConc = 2; growthMaxTrades = 6; }
       else if(bal < 300.0) { growthRiskMult = 0.76; growthMaxConc = 2; growthMaxTrades = 7; }
@@ -2053,7 +2096,7 @@ void DetectCapitalMode()
          double sp       = (double)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
          // Costo de spread en 1 lote mínimo
          double spreadUSD = (tickSz > 0 && tickVal > 0) ? sp * tickVal * minLot : 0.0;
-         double ddFromBal   = bal * 0.080;          // 8% base (era 2%)
+         double ddFromBal   = bal * 0.120;          // 12% MICRO (spread solo ya cuesta 3-5%)
          double ddMinSpread = spreadUSD * 5.0;      // floor: 5 trades de spread
          g_dailyLossUSD = MathMax(ddFromBal, ddMinSpread);
          g_dailyLossUSD = MathMin(g_dailyLossUSD, bal * 0.15); // hard cap 15%
@@ -2191,12 +2234,24 @@ void CheckDDEscalation()
 
    if(g_opMode == OPMODE_GROWTH)
    {
-      // Growth Mode: 4 niveles granulares — evita reacción prematura a floating normal
-      if(ddPct >= 10.0)     { g_ddLevel = 3; g_lotMultDD = 0.0;  CloseAllPositions(); }
-      else if(ddPct >= 7.0) { g_ddLevel = 2; g_lotMultDD = 0.50; }
-      else if(ddPct >= 4.5) { g_ddLevel = 1; g_lotMultDD = 0.70; }
-      else if(ddPct >= 2.5) { g_ddLevel = 0; g_lotMultDD = 0.88; } // aviso suave, no bloqueo
-      else                  { g_ddLevel = 0; g_lotMultDD = 1.0;  }
+      if(g_capMode == CAP_MICRO)
+      {
+         // MICRO: umbrales más amplios — el spread ya representa 3-5% del capital por sí solo
+         // Cerrar todo a 15% (no 10%): evitar stop prematuro por spread floating
+         if(ddPct >= 15.0)     { g_ddLevel = 3; g_lotMultDD = 0.0;  CloseAllPositions(); }
+         else if(ddPct >= 9.0) { g_ddLevel = 2; g_lotMultDD = 0.50; }
+         else if(ddPct >= 5.0) { g_ddLevel = 1; g_lotMultDD = 0.70; }
+         else                  { g_ddLevel = 0; g_lotMultDD = 1.0;  }
+      }
+      else
+      {
+         // GROWTH non-MICRO (SMALL, MEDIUM): 4 niveles granulares
+         if(ddPct >= 10.0)     { g_ddLevel = 3; g_lotMultDD = 0.0;  CloseAllPositions(); }
+         else if(ddPct >= 7.0) { g_ddLevel = 2; g_lotMultDD = 0.50; }
+         else if(ddPct >= 4.5) { g_ddLevel = 1; g_lotMultDD = 0.70; }
+         else if(ddPct >= 2.5) { g_ddLevel = 0; g_lotMultDD = 0.88; }
+         else                  { g_ddLevel = 0; g_lotMultDD = 1.0;  }
+      }
    }
    else
    {
@@ -2454,6 +2509,7 @@ void InitiateRecovery(int sId, bool isLong, double baseLot)
 {
    if(g_recovActive)        return;   // no stacking
    if(g_consecLosses > 3)  return;   // 4+ losses = full stop, no recovery
+   if(g_capMode == CAP_MICRO) return;  // Recovery inviable en micro-capital — exposición letal
    if(sId < 0)              return;
 
    g_recovActive        = true;
@@ -2825,9 +2881,30 @@ bool OpenTrade(int sId, bool isBuy, ENUM_TIMEFRAMES slTF, double slMult, double 
    double atr = g_tf[idx].atr;
    if(atr <= 0) return false;
 
+   // ── SL reducido para MICRO: 0.70× el multiplicador ATR ─────────────
+   // Reduce el dollar-risk por trade ~30% en cuentas de capital mínimo.
+   if(g_capMode == CAP_MICRO) slMult *= 0.70;
+
    double price = isBuy ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
                         : SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double sl = isBuy ? price - atr*slMult : price + atr*slMult;
+
+   // ── Margin safety check: rechaza trade si margen requerido > 60% del libre ──
+   {
+      double freeMargin  = AccountInfoDouble(ACCOUNT_FREEMARGIN);
+      long   leverage    = AccountInfoInteger(ACCOUNT_LEVERAGE);
+      double contractSz  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_CONTRACT_SIZE);
+      // Estimación del margen requerido para 1 lote mínimo
+      double minL_mg     = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+      double marginPerMinLot = (leverage > 0 && contractSz > 0)
+                               ? (price * contractSz * minL_mg) / (double)leverage
+                               : 0;
+      // Calcular lote que se va a usar (aproximado con slMult actual)
+      double estimLot    = CalcLot(MathAbs(price - sl));
+      double marginNeeded= (marginPerMinLot > 0 && minL_mg > 0)
+                           ? (estimLot / minL_mg) * marginPerMinLot : 0;
+      if(marginPerMinLot > 0 && marginNeeded > freeMargin * 0.60) return false;
+   }
    double tp = isBuy ? price + atr*tpMult : price - atr*tpMult;
    double lot = CalcLot(MathAbs(price - sl));
    if(lot <= 0) return false;
@@ -2879,15 +2956,20 @@ double CalcLot(double slDistPrice)
       lot = riskUSD * tickSz / (tickVal * slDistPrice);
 
       // Para CAP_MICRO (bal < $50) el cálculo porcentual da lot < minL.
-      // MICRO: siempre usar minLot — es la única opción viable, sin guardPct.
-      //   Razón: con $10-$49, minLot=0.01 es literalmente el lote más pequeño posible.
-      //   Rechazar el trade significa 0 operaciones. Aceptar minLot da oportunidad de crecer.
+      // MICRO: usar minLot SOLO si el riesgo real resultante es manejable.
+      //   Guard de riesgo: si un SL con minLot implica >8% del balance → rechazar trade.
+      //   Razón: $14 × 8% = $1.12 máx tolerable por trade. Si el SL es demasiado amplio,
+      //   no hay lote seguro posible → esperar mejor configuración de mercado.
       // SMALL/MEDIUM+: guardia proporcional para evitar riesgo excesivo accidental.
       if(lot < minL)
       {
          if(g_capMode == CAP_MICRO)
          {
-            lot = minL;   // MICRO: siempre minLot sin restricción de guardPct
+            // Calcular riesgo real si se fuerza minLot
+            double slUSD_minL  = slDistPrice * tickVal * minL / tickSz;
+            double riskPctReal = (bal > 0) ? slUSD_minL / bal * 100.0 : 999.0;
+            if(riskPctReal > 8.0) return 0;  // SL demasiado amplio → no operar
+            lot = minL;
          }
          else
          {
