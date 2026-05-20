@@ -149,9 +149,13 @@ const string gTFNames[NUM_TFS] = {
 
 // ── Capital floors & confidence thresholds ──────────────────────────────
 #define MIN_CAPITAL_USD      9.50   // Hard floor live: refuse to operate below
-#define CONF_THRESH_MICRO   75.0   // Scoring gate: GROWTH + CAP_MICRO — alta precisión
-#define CONF_THRESH_SMALL   62.0   // Scoring gate: GROWTH + CAP_SMALL/MEDIUM
-#define CONF_THRESH_STD     50.0   // Scoring gate: STANDARD mode
+#define CONF_THRESH_MICRO   85.0   // Per-strategy gate: GROWTH + CAP_MICRO
+#define CONF_THRESH_SMALL   75.0   // Per-strategy gate: GROWTH + CAP_SMALL/MEDIUM
+#define CONF_THRESH_STD     65.0   // Per-strategy gate: STANDARD mode
+// Global market quality gate thresholds (Layer 0 meta-filter)
+#define GLOBAL_GATE_MICRO   85.0
+#define GLOBAL_GATE_SMALL   75.0
+#define GLOBAL_GATE_STD     65.0
 
 //====================================================================
 //  INDICATOR HANDLES — 8 TFs, set completo por TF principal
@@ -206,6 +210,44 @@ RegimeScoreData g_regScore;
 
 // Signal confidence per strategy (updated by CalcSignalConfidence)
 double g_stratConfidence[NUM_STRATS];
+
+// Global market quality score (Layer 0 gate — updated per RunActiveStrategies call)
+double g_globalMarketScore = 0;
+
+//====================================================================
+//  LIQUIDITY CONTEXT — shared session/PDH/PDL proximity state
+//====================================================================
+struct LiquidityContext
+{
+   double sessionHi, sessionLo;  // running session high/low (reset each day)
+   double pdh, pdl;              // previous day high/low
+   double weekHi, weekLo;        // current week high/low
+   bool   nearHTFLevel;          // price within ATR×0.5 of key level
+   bool   compressionState;      // BB squeeze (bbWidth < avg×0.55)
+   bool   expansionState;        // BB expansion (bbWidth > avg×1.35)
+};
+LiquidityContext g_liq;
+
+//====================================================================
+//  TRADE CANDIDATE — arbitration engine
+//====================================================================
+struct TradeCandidate
+{
+   int    stratId;
+   bool   isBuy;
+   double confidence;      // CalcSignalConfidence 0-100
+   double liquidityScore;  // LiquidityAlignmentScore 0-100
+   double compositeScore;  // final weighted score
+   bool   valid;
+};
+TradeCandidate g_candidates[NUM_STRATS];
+int            g_nCandidates  = 0;
+bool           g_evalMode     = false;  // TryS*() fills g_pendingCand instead of executing
+TradeCandidate g_pendingCand;
+
+// Market tradability gate (set by UpdateMarketContext each tick)
+bool   g_marketTradable   = false;
+double g_tradabilityScore = 0;
 
 // Equity peak por sesión — para compounding adaptativo
 double g_equityPeakSession = 0.0;
@@ -388,13 +430,12 @@ int OnInit()
       "Asian Range", "Mean Reversion BB", "Structure Break H1", "PDH/PDL Breakout",
       "Momentum M15", "Compression Break", "H1 Continuation", "Volume Impulse"
    };
-   // Todas las estrategias operan con gate M1 — el análisis usa datos
-   // cacheados de TFs superiores (M5, H1, D1) pero la entrada se confirma
-   // en cierre de vela M1, igual que el QQ real.
+   // Gate por TF nativo de cada estrategia — previene multi-fire en H1 strats.
+   // S1=M5, S2=H1, S3=M5, S4=M5, S5=M5, S6=M5, S7=H1, S8=M15, S9=M15, S10=M15, S11=H1, S12=M6
    ENUM_TIMEFRAMES entryTFs[NUM_STRATS] = {
-      PERIOD_M1, PERIOD_M1, PERIOD_M1, PERIOD_M1,
-      PERIOD_M1, PERIOD_M1, PERIOD_M1, PERIOD_M1,
-      PERIOD_M1, PERIOD_M1, PERIOD_M1, PERIOD_M1
+      PERIOD_M5,  PERIOD_H1,  PERIOD_M5,  PERIOD_M5,
+      PERIOD_M5,  PERIOD_M5,  PERIOD_H1,  PERIOD_M15,
+      PERIOD_M15, PERIOD_M15, PERIOD_H1,  PERIOD_M6
    };
    // Grid stacking solo en estrategias trend-continuation
    // (replican el "trend-following grid" del QQ real, añaden capa
@@ -457,6 +498,7 @@ int OnInit()
    for(int s=0; s<NUM_STRATS; s++) g_stratConfidence[s] = 0.0;
    g_regScore.trending = 0; g_regScore.ranging = 0;
    g_regScore.volatile_= 0; g_regScore.momentum= 0; g_regScore.confidence = 0;
+   g_globalMarketScore = 0;
    ApplyBrokerSet();
    DetectCapitalMode();
    DailyReset();
@@ -522,6 +564,10 @@ void OnTick()
    // L1 — Regime
    UpdateRegime();
    UpdateNYRange();   // siempre construir rango NY hora 12, sin depender de régimen
+
+   // L1b — Market Context + Liquidity (QQ pipeline: after regime, before strategies)
+   UpdateMarketContext();
+   UpdateLiquidityContext();
 
    // L6 — Protección (DD/recovery antes de cualquier entrada)
    CheckDDEscalation();
@@ -841,55 +887,100 @@ string RegimeStr()
 
 //====================================================================
 //  SIGNAL CONFIDENCE SCORING — 0-100 por estrategia y dirección
-//  Combina: regime score + H1 direction + D1 alignment + ADX + ATR
+//  Factor table (QQ reverse engineering):
+//    HTF trend  (D1+H1 aligned direction)  : 25 pts
+//    Regime fit (confidence × weight)       : 20 pts
+//    Volatility (ATR quality)               : 15 pts
+//    Session    (prime window bonus)        : 10 pts
+//    Pullback   (RSI + price vs EMA)        : 15 pts
+//    Trigger    (candle body + ADX confirm) : 15 pts
 //====================================================================
 double CalcSignalConfidence(int sId, bool isBuy)
 {
    double score = 0;
-   int iH1 = TFIdx(PERIOD_H1);
-   int iM5 = TFIdx(PERIOD_M5);
+   int iH1  = TFIdx(PERIOD_H1);
+   int iM5  = TFIdx(PERIOD_M5);
+   int iD1  = TFIdx(PERIOD_D1);
+   int iM15 = TFIdx(PERIOD_M15);
 
-   // Regime confidence (0-30 pts)
-   score += g_regScore.confidence * 0.30;
+   // ─── HTF trend: D1 + H1 aligned in trade direction (0-25) ──────
+   bool d1Ok  = isBuy ? g_d1TrendUp  : g_d1TrendDn;
+   bool h1Ok  = isBuy ? g_h1TrendUp  : g_h1TrendDn;
+   if     (d1Ok && h1Ok)   score += 25;   // full HTF alignment
+   else if(h1Ok)           score += 15;   // H1 only
+   else if(d1Ok)           score +=  8;   // D1 only
+   // conflicting HTF = 0
 
-   // H1 direction alignment (0-25 pts)
-   if     (isBuy  && g_h1TrendUp)                         score += 25;
-   else if(!isBuy && g_h1TrendDn)                         score += 25;
-   else if(!(isBuy && g_h1TrendDn) && !(!isBuy && g_h1TrendUp)) score +=  8;  // neutral H1
+   // ─── Regime fit: confidence of dominant regime (0-20) ──────────
+   // Scale regime confidence to 20 max
+   score += g_regScore.confidence * 0.20;
 
-   // D1 alignment (0-15 pts)
-   if(isBuy  && g_d1TrendUp) score += 15;
-   if(!isBuy && g_d1TrendDn) score += 15;
-
-   // ADX H1 strength (0-15 pts)
-   if     (g_adxH1 > 30) score += 15;
-   else if(g_adxH1 > 25) score += 10;
-   else if(g_adxH1 > 20) score +=  5;
-
-   // ATR en rango saludable vs media (0-10 pts / penalización -8)
+   // ─── Volatility: ATR in optimal trade range (0-15) ─────────────
    if(iM5 >= 0 && g_tf[iM5].valid && g_atrAvgM5 > 0)
    {
       double ar = g_tf[iM5].atr / g_atrAvgM5;
-      if     (ar >= 0.75 && ar <= 1.60) score += 10;
-      else if(ar < 0.40  || ar > 2.50)  score -=  8;
+      if     (ar >= 0.75 && ar <= 1.50) score += 15;  // ideal spread×reward ratio
+      else if(ar >= 0.55 && ar <  0.75) score +=  8;  // slightly subdued
+      else if(ar >  1.50 && ar <= 2.00) score +=  8;  // slightly elevated
+      else if(ar <  0.40 || ar >  2.50) score -=  8;  // dead or spike — penalize
    }
+   else score += 7;   // no data: neutral
 
-   // RSI H1 — penaliza extremos, premia zona saludable
+   // ─── Session: prime trading window (0-10) ──────────────────────
+   MqlDateTime dtC; TimeToStruct(TimeCurrent(), dtC);
+   int hC = dtC.hour, hmC = hC*60 + dtC.min;
+   bool primeLon = (hC >= 8  && hC < 11);
+   bool primeNY  = (hmC >= 13*60+30 && hmC < 17*60);
+   bool overlap  = (hC == 13);
+   bool anyEU    = (hC >= 7  && hC < 18);
+   if     (primeLon || primeNY)  score += 10;
+   else if(overlap)              score +=  9;
+   else if(anyEU)                score +=  4;
+   // Bonos específicos de estrategia dentro de sesión
+   if(sId == 2 && hC >= 8 && hC < 11)              score +=  2;  // S3 London prime
+   if(sId == 3 && hmC >= 13*60+30 && hmC < 17*60)  score +=  2;  // S4 NY prime
+
+   // ─── Pullback quality: RSI position + price vs EMA21 (0-15) ───
    if(iH1 >= 0 && g_tf[iH1].valid)
    {
       double rsi = g_tf[iH1].rsi;
-      if( isBuy && rsi > 72) score -= 10;
-      if(!isBuy && rsi < 28) score -= 10;
-      if( isBuy && rsi >  55 && rsi < 68) score += 5;
-      if(!isBuy && rsi >= 32 && rsi < 45) score += 5;
+      // Healthy RSI zone for direction (not overextended)
+      if(isBuy)
+      {
+         if(rsi >= 40 && rsi <= 65)   score += 10;  // healthy bull zone
+         else if(rsi > 65 && rsi < 72) score +=  4;  // slightly hot
+         else if(rsi >= 72)           score -=  8;  // overbought
+      }
+      else
+      {
+         if(rsi >= 35 && rsi <= 60)   score += 10;
+         else if(rsi > 28 && rsi < 35) score +=  4;
+         else if(rsi <= 28)           score -=  8;
+      }
+      // Price vs H1 EMA21: pullback into EMA = cleaner entry (5 pts)
+      double e21 = g_tf[iH1].ema21;
+      double atrH = g_tf[iH1].atr;
+      double distEMA = MathAbs(g_tf[iH1].closeNow - e21);
+      if(distEMA < atrH * 0.5)        score +=  5;  // near EMA = pullback
    }
 
-   // Bonus de sesión para estrategias con gate horario
-   MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
-   int hm = dt.hour*60 + dt.min;
-   if(sId == 2 && dt.hour >= 8 && dt.hour < 11)         score += 5;  // S3 London
-   if(sId == 3 && hm >= 13*60+30 && hm < 17*60)         score += 5;  // S4 NY
-   if(sId == 7 && dt.hour >= 7  && dt.hour < 15)        score += 3;  // S8 PDH window
+   // ─── Trigger quality: ADX momentum + candle body (0-15) ────────
+   // ADX H1 confirms directional momentum
+   if     (g_adxH1 > 30) score += 8;
+   else if(g_adxH1 > 25) score += 5;
+   else if(g_adxH1 > 20) score += 2;
+   // M15 candle body quality (close matches direction)
+   if(iM15 >= 0 && g_tf[iM15].valid)
+   {
+      double m15Body  = MathAbs(g_tf[iM15].close1 - g_tf[iM15].open1);
+      double m15Range = g_tf[iM15].high1 - g_tf[iM15].low1;
+      if(m15Range > 0 && m15Body / m15Range >= 0.50)
+      {
+         bool m15Dir = isBuy ? (g_tf[iM15].close1 > g_tf[iM15].open1)
+                             : (g_tf[iM15].close1 < g_tf[iM15].open1);
+         if(m15Dir) score += 7;
+      }
+   }
 
    return MathMax(0.0, MathMin(100.0, score));
 }
@@ -902,6 +993,125 @@ double ConfidenceThreshold()
       return CONF_THRESH_SMALL;
    }
    return CONF_THRESH_STD;
+}
+
+//====================================================================
+//  GLOBAL MARKET QUALITY ENGINE — Layer 0 meta-filter
+//  Pregunta: ¿Está el mercado en condiciones de ser operado ahora?
+//  Esta función es DIRECCIÓN-NEUTRAL — evalúa calidad del entorno,
+//  no la dirección del trade. Se corre antes de cualquier estrategia.
+//
+//  Factor table (QQ reverse engineering):
+//    D1 bias            : 15 pts
+//    H1 bias            : 20 pts
+//    Regime confidence  : 15 pts
+//    Session alignment  : 10 pts
+//    ATR quality        : 10 pts
+//    Structure quality  : 15 pts
+//    Setup quality      : 15 pts
+//  Total max            : 100 pts
+//====================================================================
+double CalcGlobalMarketScore()
+{
+   double score = 0;
+   int iD1  = TFIdx(PERIOD_D1);
+   int iH1  = TFIdx(PERIOD_H1);
+   int iM5  = TFIdx(PERIOD_M5);
+   if(iH1 < 0 || !g_tf[iH1].valid) return 0;
+
+   // ─── Factor 1: D1 bias (0-15) ───────────────────────────────────
+   // D1 EMA triple stack = clear daily institutional direction
+   if(iD1 >= 0 && g_tf[iD1].valid)
+   {
+      bool d1StackUp = (g_tf[iD1].ema9 > g_tf[iD1].ema21 && g_tf[iD1].ema21 > g_tf[iD1].ema50);
+      bool d1StackDn = (g_tf[iD1].ema9 < g_tf[iD1].ema21 && g_tf[iD1].ema21 < g_tf[iD1].ema50);
+      if(d1StackUp || d1StackDn)                              score += 15;
+      else if(g_tf[iD1].ema9 != g_tf[iD1].ema21)             score +=  7;  // partial
+   }
+   else score += 7;  // no D1 data: neutral
+
+   // ─── Factor 2: H1 bias (0-20) ───────────────────────────────────
+   // H1 triple EMA stack = institutional directional flow
+   bool h1StackUp = (g_tf[iH1].ema9 > g_tf[iH1].ema21 && g_tf[iH1].ema21 > g_tf[iH1].ema50);
+   bool h1StackDn = (g_tf[iH1].ema9 < g_tf[iH1].ema21 && g_tf[iH1].ema21 < g_tf[iH1].ema50);
+   if     (h1StackUp || h1StackDn)            score += 20;
+   else if(g_tf[iH1].ema9 != g_tf[iH1].ema21) score +=  8;  // partial
+
+   // ─── Factor 3: Regime confidence (0-15) ─────────────────────────
+   // g_regScore.confidence is 0-100; scale to 15
+   score += g_regScore.confidence * 0.15;
+
+   // ─── Factor 4: Session alignment (0-10) ─────────────────────────
+   MqlDateTime dtG; TimeToStruct(TimeCurrent(), dtG);
+   int hG = dtG.hour, hmG = hG*60 + dtG.min;
+   bool primeLon  = (hG >= 8 && hG < 11);
+   bool primeNY   = (hmG >= 13*60+30 && hmG < 17*60);
+   bool overlap   = (hG == 13);
+   bool euSession = (hG >= 7 && hG < 18);
+   if     (primeLon || primeNY) score += 10;
+   else if(overlap)             score +=  9;
+   else if(euSession)           score +=  4;
+   // Asia/off-hours = 0 (XAUUSD drift, spread cost hurts)
+
+   // ─── Factor 5: ATR quality (0-10) ───────────────────────────────
+   // Healthy ATR = spread is small relative to potential move
+   if(iM5 >= 0 && g_tf[iM5].valid && g_atrAvgM5 > 0)
+   {
+      double ar = g_tf[iM5].atr / g_atrAvgM5;
+      if     (ar >= 0.70 && ar <= 1.50) score += 10;  // ideal
+      else if(ar >= 0.50 && ar <  0.70) score +=  5;  // subdued
+      else if(ar >  1.50 && ar <= 2.20) score +=  5;  // elevated
+      // <0.50 (dead market) or >2.20 (extreme spike) = 0 pts
+   }
+   else score += 5;  // no ATR data: neutral
+
+   // ─── Factor 6: Structure quality (0-15) ─────────────────────────
+   // Price near structural extreme (not trapped in mid-range chop)
+   double swH = g_tf[iH1].swingH10;
+   double swL = g_tf[iH1].swingL10;
+   if(swH > swL && (swH - swL) > 0)
+   {
+      double rangeH   = swH - swL;
+      double midRange = (swH + swL) * 0.5;
+      double distMid  = MathAbs(g_tf[iH1].closeNow - midRange) / rangeH;
+      // distMid: 0=center, 0.5=at extreme
+      if     (distMid >= 0.35) score += 15;  // near structure level
+      else if(distMid >= 0.20) score +=  7;  // moderate displacement
+      // <0.20 = mid-range noise = 0 pts
+   }
+   else score += 7;  // no swing data: neutral
+
+   // ─── Factor 7: Setup quality — MTF directional alignment (0-15) ─
+   // Count how many TFs agree on direction (either direction)
+   int alignUp = 0, alignDn = 0;
+   if(iM5 >= 0 && g_tf[iM5].valid)
+   {
+      if(g_tf[iM5].ema9 > g_tf[iM5].ema21) alignUp++;
+      else                                  alignDn++;
+   }
+   if(g_tf[iH1].ema9 > g_tf[iH1].ema21) alignUp++;
+   else                                  alignDn++;
+   if(iD1 >= 0 && g_tf[iD1].valid)
+   {
+      if(g_tf[iD1].ema9 > g_tf[iD1].ema21) alignUp++;
+      else                                  alignDn++;
+   }
+   int maxAlign = MathMax(alignUp, alignDn);
+   if     (maxAlign == 3) score += 15;  // all TFs agree
+   else if(maxAlign == 2) score +=  8;  // majority
+   // 1/3 = total conflict = 0 pts
+
+   return MathMax(0.0, MathMin(100.0, score));
+}
+
+double GlobalGateThreshold()
+{
+   if(g_opMode == OPMODE_GROWTH)
+   {
+      if(g_capMode == CAP_MICRO) return GLOBAL_GATE_MICRO;
+      return GLOBAL_GATE_SMALL;
+   }
+   return GLOBAL_GATE_STD;
 }
 
 //====================================================================
@@ -919,8 +1129,8 @@ void ActivateStrategies()
    bool inLonTrade = (hour >= 8  && hour < 11);
    bool inNYRange  = (hour == 12);
    bool inNYTrade  = (hm >= 13*60+30 && hm < 17*60);
-   bool inAsiaRng  = (hour >= 22 || hour < 1);
-   bool inAsiaTrd  = (hour >= 1  && hour < 5);
+   bool inAsiaRng  = (hour == 22 || hour == 23);  // sync con S5 build window
+   bool inAsiaTrd  = (hour >= 0  && hour < 5);   // sync con S5 trade window
    bool inPDHWind  = (hour >= 7  && hour < 15);
 
    // Régimen base
@@ -944,8 +1154,8 @@ void ActivateStrategies()
    g_str[4].activeRegime = ((r == REG_RANGING || r == REG_NEUTRAL)
                             && (inAsiaRng || inAsiaTrd));
 
-   // S6 Mean Reversion BB — RANGING
-   g_str[5].activeRegime = (r == REG_RANGING);
+   // S6 Mean Reversion BB — RANGING + NEUTRAL (QQ core strategy: WR 75% liderado por mean-rev)
+   g_str[5].activeRegime = (r == REG_RANGING || r == REG_NEUTRAL);
 
    // S7 Structure Break — TRENDING o transición
    g_str[6].activeRegime = (r == REG_TRENDING || r == REG_VOLATILE);
@@ -1095,9 +1305,9 @@ bool HasCandleConfirmation(ENUM_TIMEFRAMES tf, bool isBuy)
    double body      = MathAbs(c - o);
    double bodyRatio = body / range;
    double atrRatio  = (g_tf[idx].atr > 0) ? (body / g_tf[idx].atr) : 0;
-   // Growth Mode: 40% body ratio + 35% ATR — filtra señales débiles
-   double minBody = (g_opMode == OPMODE_GROWTH) ? 0.40 : 0.30;
-   double minATR  = (g_opMode == OPMODE_GROWTH) ? 0.35 : 0.25;
+   // Growth Mode: 45% body ratio + 40% ATR — filtra señales débiles
+   double minBody = (g_opMode == OPMODE_GROWTH) ? 0.45 : 0.50;
+   double minATR  = (g_opMode == OPMODE_GROWTH) ? 0.40 : 0.30;
    if(bodyRatio < minBody || atrRatio < minATR) return false;
    return isBuy ? (c > o) : (c < o);
 }
@@ -1316,6 +1526,19 @@ bool EnterOrStackPosition(int sId, bool isBuy)
 
       // Filtro calidad entrada — solo para posiciones base (no grid layers)
       if(!CheckEntryQuality(sId, isBuy)) return false;
+
+      // ── EVAL MODE: register candidate, do NOT execute ─────────────
+      if(g_evalMode)
+      {
+         g_pendingCand.stratId    = sId;
+         g_pendingCand.isBuy      = isBuy;
+         g_pendingCand.confidence = conf;
+         g_pendingCand.liquidityScore = 0;  // filled by GenerateCandidates after call
+         g_pendingCand.compositeScore = 0;
+         g_pendingCand.valid      = true;
+         return true;  // signal: valid candidate found
+      }
+
       // Apertura base — usa RR y SL configurados en state struct
       double slMult = g_str[sId].slAtrMult;
       double rrBase = g_str[sId].rrRatio;
@@ -1327,6 +1550,7 @@ bool EnterOrStackPosition(int sId, bool isBuy)
    }
    else
    {
+      // Grid layers always bypass arbitration — continuations are immediate
       if(!CanAddGridLayer(sId, isBuy)) return false;
       AddGridLayer(sId, isBuy);
       return true;
@@ -1334,80 +1558,302 @@ bool EnterOrStackPosition(int sId, bool isBuy)
 }
 
 //====================================================================
-//  ============= LAYER 3 — 12 STRATEGY ENTRY ENGINE =============
+//  LIQUIDITY ALIGNMENT SCORE — rates candidate vs key HTF levels (0-100)
 //====================================================================
-void RunActiveStrategies()
+double LiquidityAlignmentScore(int sId, bool isBuy)
 {
-   // Daily/concurrent limits
-   if(g_tradesToday >= g_maxTradesDay) return;
-   if(CountAllOpen() >= g_maxConcurrent) return;
-   if(!FilterSpread()) return;
+   double score = 50;
+   int iM5 = TFIdx(PERIOD_M5);
+   if(iM5 < 0 || !g_tf[iM5].valid) return score;
+   double atr = g_tf[iM5].atr;
+   double cur  = g_tf[iM5].closeNow;
 
-   // FIX DUPLICADOS: Contador local de posiciones abiertas EN ESTE PASE.
-   // Soluciona el bug donde CountAllOpen() no detecta la posición recién abierta
-   // en el mismo tick (PositionsTotal() puede tener latencia de 1 tick en tester).
-   // Combinamos CountAllOpen() REAL + openedThisPass para evitar doble entrada.
-   int openedThisPass = 0;
+   // Bonus: buy above session mid or sell below — trading with session flow
+   if(g_liq.sessionHi > g_liq.sessionLo && g_liq.sessionLo > 0)
+   {
+      double smid = (g_liq.sessionHi + g_liq.sessionLo) * 0.5;
+      if( isBuy && cur > smid) score += 15;
+      if(!isBuy && cur < smid) score += 15;
+   }
 
-   // Diseño régimen-dedicado: TODAS las estrategias activas por régimen
-   // evalúan entrada SOLO en nuevo bar de su TF (no en cada tick) y
-   // requieren confirmación estructural antes de abrir.
-   // Si ya tienen posición abierta + grid habilitado: re-evalúan para
-   // añadir capa (trend-following grid stacking observado en QQ real).
+   // Bonus: buy above PDH or sell below PDL — with institutional flow
+   if(g_liq.pdh > 0 && g_liq.pdl > 0)
+   {
+      bool abovePDH = cur > g_liq.pdh + atr * 0.2;
+      bool belowPDL = cur < g_liq.pdl - atr * 0.2;
+      bool trapped  = !abovePDH && !belowPDL;
+      if( isBuy && abovePDH) score += 20;
+      if(!isBuy && belowPDL) score += 20;
+      if(trapped)            score -= 10;
+   }
+
+   // Penalty: fighting HTF level in adverse direction
+   if(g_liq.nearHTFLevel)
+   {
+      if( isBuy && g_liq.pdh > 0 && cur < g_liq.pdh && MathAbs(cur - g_liq.pdh) < atr * 0.5) score -= 15;
+      if(!isBuy && g_liq.pdl > 0 && cur > g_liq.pdl && MathAbs(cur - g_liq.pdl) < atr * 0.5) score -= 15;
+   }
+
+   // Breakout strategies benefit from expansion, penalized in compression
+   bool isBreakStrat = (sId==2||sId==3||sId==4||sId==7||sId==9);
+   if(isBreakStrat && g_liq.expansionState)   score += 10;
+   if(isBreakStrat && g_liq.compressionState) score -= 20;
+
+   return MathMax(0.0, MathMin(100.0, score));
+}
+
+//====================================================================
+//  UPDATE MARKET CONTEXT — tradability score + g_marketTradable gate
+//====================================================================
+void UpdateMarketContext()
+{
+   g_tradabilityScore = 0;
+   int iM5 = TFIdx(PERIOD_M5);
+   int iH1 = TFIdx(PERIOD_H1);
+   if(iM5 < 0 || !g_tf[iM5].valid) { g_marketTradable = false; return; }
+   double score = 0;
+   double atr5  = g_tf[iM5].atr;
+
+   // Factor 1: Spread quality (0-25)
+   double spread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) * _Point;
+   if(atr5 > 0)
+   {
+      double sr = spread / atr5;
+      if     (sr <= 0.05) score += 25;
+      else if(sr <= 0.10) score += 18;
+      else if(sr <= 0.18) score += 10;
+   }
+
+   // Factor 2: ATR energy (0-25)
+   if(g_atrAvgM5 > 0)
+   {
+      double ar = atr5 / g_atrAvgM5;
+      if     (ar >= 0.60 && ar <= 2.00) score += 25;
+      else if(ar >= 0.40 && ar <  0.60) score += 10;
+      else if(ar >  2.00 && ar <= 3.00) score += 10;
+   }
+   else score += 12;
+
+   // Factor 3: Session relevance (0-20)
+   MqlDateTime dtM; TimeToStruct(TimeCurrent(), dtM);
+   int hmM = dtM.hour*60 + dtM.min;
+   bool primeLon = (dtM.hour >= 8 && dtM.hour < 11);
+   bool primeNY  = (hmM >= 13*60+30 && hmM < 17*60);
+   bool earlyEU  = (dtM.hour >= 7 && dtM.hour < 8);
+   bool lateNY   = (hmM >= 17*60 && hmM < 18*60);
+   if     (primeLon || primeNY) score += 20;
+   else if(earlyEU  || lateNY)  score += 10;
+   else if(dtM.hour >= 7 && dtM.hour < 18) score += 5;
+
+   // Factor 4: ADX energy — dead market filter (all modes) (0-20)
+   if     (g_adxH1 >= 18) score += 20;
+   else if(g_adxH1 >= 12) score += 10;
+
+   // Factor 5: RSI energy (0-10)
+   if(iH1 >= 0 && g_tf[iH1].valid)
+   {
+      double rsi = g_tf[iH1].rsi;
+      if     (rsi <= 30 || rsi >= 70) score += 10;
+      else if(rsi <= 40 || rsi >= 60) score +=  5;
+   }
+
+   g_tradabilityScore = MathMax(0.0, MathMin(100.0, score));
+   double tGate = (g_capMode == CAP_MICRO) ? 50.0
+                : (g_capMode == CAP_SMALL ) ? 40.0 : 35.0;
+   g_marketTradable = (g_tradabilityScore >= tGate);
+}
+
+//====================================================================
+//  UPDATE LIQUIDITY CONTEXT — session levels, PDH/PDL, proximity
+//====================================================================
+void UpdateLiquidityContext()
+{
+   int iM5 = TFIdx(PERIOD_M5);
+   if(iM5 < 0 || !g_tf[iM5].valid) return;
+   double atr = g_tf[iM5].atr;
+   double cur  = g_tf[iM5].closeNow;
+
+   g_liq.pdh = iHigh(_Symbol, PERIOD_D1, 1);
+   g_liq.pdl = iLow (_Symbol, PERIOD_D1, 1);
+
+   // Running session high/low (reset by CheckDayReset via g_sessionHiLo fields)
+   if(g_liq.sessionHi == 0 || g_tf[iM5].highNow > g_liq.sessionHi) g_liq.sessionHi = g_tf[iM5].highNow;
+   if(g_liq.sessionLo == 0 || g_tf[iM5].lowNow  < g_liq.sessionLo) g_liq.sessionLo = g_tf[iM5].lowNow;
+
+   // Week high/low — last 5 D1 bars
+   g_liq.weekHi = 0; g_liq.weekLo = DBL_MAX;
+   for(int k=0; k<5; k++)
+   {
+      double wH = iHigh(_Symbol, PERIOD_D1, k);
+      double wL = iLow (_Symbol, PERIOD_D1, k);
+      if(wH > g_liq.weekHi) g_liq.weekHi = wH;
+      if(wL < g_liq.weekLo) g_liq.weekLo = wL;
+   }
+   if(g_liq.weekLo == DBL_MAX) g_liq.weekLo = 0;
+
+   // Near HTF level — within ATR×0.5 of any key level
+   double prox = atr * 0.5;
+   g_liq.nearHTFLevel = (g_liq.pdh > 0 && MathAbs(cur - g_liq.pdh) < prox)
+                     || (g_liq.pdl > 0 && MathAbs(cur - g_liq.pdl) < prox)
+                     || (g_liq.weekHi > 0 && MathAbs(cur - g_liq.weekHi) < prox)
+                     || (g_liq.weekLo > 0 && MathAbs(cur - g_liq.weekLo) < prox);
+
+   g_liq.compressionState = (g_bbWidthAvgM5 > 0) && (g_tf[iM5].bbWidth < g_bbWidthAvgM5 * 0.55);
+   g_liq.expansionState   = (g_bbWidthAvgM5 > 0) && (g_tf[iM5].bbWidth > g_bbWidthAvgM5 * 1.35);
+}
+
+//====================================================================
+//  CANDIDATE PIPELINE — generate → score → arbitrate → execute
+//====================================================================
+void GenerateCandidates()
+{
+   g_nCandidates = 0;
+   g_evalMode    = true;
+
    for(int s=0; s<NUM_STRATS; s++)
    {
-      if(!g_str[s].activeRegime) continue;
-      if(CountAllOpen() + openedThisPass >= g_maxConcurrent) break;  // FIX DUPLICADOS
-      // Bar-close gate por TF de la estrategia
-      if(!IsNewBarForStrat(s)) continue;
+      if(!g_str[s].activeRegime)  continue;
+      if(g_str[s].posCount > 0)   continue;  // grid handled in grid pass
+      if(!IsNewBarForStrat(s))    continue;
 
-      // Growth Mode: filtros adicionales de calidad
+      // Growth mode quality filters
       if(g_opMode == OPMODE_GROWTH)
       {
-         // ADX≥28 para estrategias trend; MICRO: ADX≥18 como piso mínimo de estructura
          bool isTrendStrat = (s==0||s==1||s==6||s==10);
          int adxFloor = (g_capMode == CAP_MICRO) ? 18 : 28;
          if(isTrendStrat && g_adxH1 < adxFloor) { MarkStratBarConsumed(s); continue; }
-         // MICRO: mercado muerto (ADX<15) = no operar nada, spread mata cualquier ganancia
          if(g_capMode == CAP_MICRO && g_adxH1 < 15) { MarkStratBarConsumed(s); continue; }
-
-         // Filtro de sesión alta probabilidad — aplica a TODOS los modos:
-         // HIGH: London 08-11 GMT + NY 13:30-17 GMT → todas las estrategias elegibles
-         // LOW (resto): solo estrategias con gate de sesión propio (S3,S4,S5,S8)
-         // S3,S4,S8 (whitelist MICRO) tienen sus propias ventanas → pasan siempre
-         {
-            MqlDateTime dtG; TimeToStruct(TimeCurrent(), dtG);
-            int hG = dtG.hour, hmG = hG*60 + dtG.min;
-            bool highSession = (hG >= 8 && hG < 11) || (hmG >= 13*60+30 && hmG < 17*60);
-            bool isSessionGated = (s==2||s==3||s==4||s==7); // S3,S4,S5,S8 gestionan su sesión
-            if(!highSession && !isSessionGated) { MarkStratBarConsumed(s); continue; }
-         }
+         MqlDateTime dtG; TimeToStruct(TimeCurrent(), dtG);
+         int hG = dtG.hour, hmG = hG*60 + dtG.min;
+         bool highSession = (hG >= 8 && hG < 11) || (hmG >= 13*60+30 && hmG < 17*60);
+         bool isSessionGated = (s==2||s==3||s==4||s==7);
+         if(!highSession && !isSessionGated) { MarkStratBarConsumed(s); continue; }
       }
 
-      // Si tiene posición base, solo entra como grid layer
-      bool isGridMode = (g_str[s].posCount > 0);
-      if(isGridMode && !g_str[s].gridEnabled) { MarkStratBarConsumed(s); continue; }
-      if(isGridMode && g_str[s].gridLayers >= MAX_GRID_LAYERS - 1) { MarkStratBarConsumed(s); continue; }
+      g_pendingCand.valid   = false;
+      g_pendingCand.stratId = s;
+
+      switch(s)
+      {
+         case  0: TryS1_TrendFollow();       break;
+         case  1: TryS2_PullbackEMA();       break;
+         case  2: TryS3_LondonORB();         break;
+         case  3: TryS4_NYSession();         break;
+         case  4: TryS5_AsianRange();        break;
+         case  5: TryS6_MeanReversion();     break;
+         case  6: TryS7_StructureBreak();    break;
+         case  7: TryS8_PDHPDLBreak();       break;
+         case  8: TryS9_MomentumM15();       break;
+         case  9: TryS10_CompressionBreak(); break;
+         case 10: TryS11_H1Continuation();  break;
+         case 11: TryS12_VolumeImpulse();    break;
+      }
+
+      if(g_pendingCand.valid && g_nCandidates < NUM_STRATS)
+      {
+         double liq = LiquidityAlignmentScore(g_pendingCand.stratId, g_pendingCand.isBuy);
+         g_pendingCand.liquidityScore = liq;
+         g_pendingCand.compositeScore = g_pendingCand.confidence * 0.65 + liq * 0.35;
+         g_candidates[g_nCandidates++] = g_pendingCand;
+      }
+
+      MarkStratBarConsumed(s);
+   }
+
+   g_evalMode = false;
+}
+
+TradeCandidate ArbitrateBestCandidate()
+{
+   TradeCandidate best;
+   best.valid          = false;
+   best.stratId        = -1;
+   best.isBuy          = false;
+   best.confidence     = 0;
+   best.liquidityScore = 0;
+   best.compositeScore = 0;
+   for(int i=0; i<g_nCandidates; i++)
+   {
+      if(!g_candidates[i].valid) continue;
+      if(g_candidates[i].compositeScore > best.compositeScore)
+         best = g_candidates[i];
+   }
+   return best;
+}
+
+bool ExecuteCandidate(TradeCandidate &cand)
+{
+   if(!cand.valid || cand.stratId < 0) return false;
+   int  sId  = cand.stratId;
+   bool isBuy = cand.isBuy;
+   if(g_str[sId].posCount > 0) return false;
+   double slMult = g_str[sId].slAtrMult;
+   double rrBase = g_str[sId].rrRatio;
+   if(g_capMode == CAP_MICRO && (sId==2||sId==3||sId==7))
+      rrBase = MathMax(rrBase, 2.0);
+   double tpMult = slMult * rrBase;
+   bool ok = OpenTrade(sId, isBuy, g_str[sId].entryTF, slMult, tpMult);
+   if(ok)
+   {
+      // Set session-range fired flags for ORB/NY/Asian (bypassed in eval mode)
+      if(sId == 2) { if(isBuy) g_orbFiredLong  = true; else g_orbFiredShort = true; }
+      if(sId == 3) { if(isBuy) g_nyFiredLong   = true; else g_nyFiredShort  = true; }
+      if(sId == 4) { if(isBuy) g_asFiredLong   = true; else g_asFiredShort  = true; }
+   }
+   return ok;
+}
+
+//====================================================================
+//  ============= LAYER 3 — 12 STRATEGY ENTRY ENGINE =============
+//  QQ pipeline: Safety→Context→Liquidity→Regime→Candidates→Score→Arbitrate→Risk→Execute
+//====================================================================
+void RunActiveStrategies()
+{
+   // ── Layer 0: Global Market Quality Gate ────────────────────────
+   g_globalMarketScore = CalcGlobalMarketScore();
+   if(g_globalMarketScore < GlobalGateThreshold()) return;
+
+   // ── Market tradability gate ─────────────────────────────────────
+   if(!g_marketTradable) return;
+
+   // ── Hard limits ─────────────────────────────────────────────────
+   if(g_tradesToday >= g_maxTradesDay) return;
+   if(!FilterSpread()) return;
+
+   // ── GRID PASS: existing positions add layers (bypass arbitration) ─
+   int openedThisPass = 0;
+   for(int s=0; s<NUM_STRATS; s++)
+   {
+      if(!g_str[s].activeRegime)                              continue;
+      if(g_str[s].posCount == 0)                             continue;
+      if(!g_str[s].gridEnabled)                              continue;
+      if(g_str[s].gridLayers >= MAX_GRID_LAYERS - 1)         continue;
+      if(CountAllOpen() + openedThisPass >= g_maxConcurrent) break;
+      if(!IsNewBarForStrat(s)) { MarkStratBarConsumed(s); continue; }
 
       bool opened = false;
       switch(s)
       {
-         case 0:  opened = TryS1_TrendFollow();       break;
-         case 1:  opened = TryS2_PullbackEMA();       break;
-         case 2:  opened = TryS3_LondonORB();         break;
-         case 3:  opened = TryS4_NYSession();         break;
-         case 4:  opened = TryS5_AsianRange();        break;
-         case 5:  opened = TryS6_MeanReversion();     break;
-         case 6:  opened = TryS7_StructureBreak();    break;
-         case 7:  opened = TryS8_PDHPDLBreak();       break;
-         case 8:  opened = TryS9_MomentumM15();       break;
-         case 9:  opened = TryS10_CompressionBreak(); break;
-         case 10: opened = TryS11_H1Continuation();   break;
-         case 11: opened = TryS12_VolumeImpulse();    break;
+         case  0: opened = TryS1_TrendFollow();       break;
+         case  1: opened = TryS2_PullbackEMA();       break;
+         case  6: opened = TryS7_StructureBreak();    break;
+         case 10: opened = TryS11_H1Continuation();  break;
+         default: break;
       }
-      if(opened) openedThisPass++;   // FIX DUPLICADOS: contabilizar inmediatamente
+      if(opened) openedThisPass++;
       MarkStratBarConsumed(s);
    }
+
+   // ── NEW POSITION PASS: arbitration engine ──────────────────────
+   if(CountAllOpen() + openedThisPass >= g_maxConcurrent) return;
+
+   GenerateCandidates();
+   if(g_nCandidates == 0) return;
+
+   TradeCandidate best = ArbitrateBestCandidate();
+   if(!best.valid) return;
+
+   if(ExecuteCandidate(best)) openedThisPass++;
 }
 
 // ===================== S1 Trend Follow M5 =====================
@@ -1426,19 +1872,21 @@ bool TryS1_TrendFollow()
    bool bullCandle = (cl1 > op1) && MathAbs(cl1-op1) >= g_tf[iM5].atr * 0.30;
    bool bearCandle = (cl1 < op1) && MathAbs(cl1-op1) >= g_tf[iM5].atr * 0.30;
 
-   // Pullback structure: low1 toca EMA21 M5 sin perforar EMA50
+   // Pullback structure: low1 toca EMA21 M5 sin perforar EMA50; close dentro de zona EMA21±1.5ATR
    bool buyPull  = upM5 && upH1 && bullCandle
                    && g_tf[iM5].low1  <= g_tf[iM5].ema21 + g_tf[iM5].atr*0.2
                    && cl1 > g_tf[iM5].ema21
+                   && cl1 <= g_tf[iM5].ema21 + g_tf[iM5].atr*1.5
                    && g_tf[iM5].rsi   > 45 && g_tf[iM5].rsi < 70;
    bool sellPull = dnM5 && dnH1 && bearCandle
                    && g_tf[iM5].high1 >= g_tf[iM5].ema21 - g_tf[iM5].atr*0.2
                    && cl1 < g_tf[iM5].ema21
+                   && cl1 >= g_tf[iM5].ema21 - g_tf[iM5].atr*1.5
                    && g_tf[iM5].rsi   < 55 && g_tf[iM5].rsi > 30;
 
-   if(buyPull && ConfirmEntry(PERIOD_M5, true, false))
+   if(buyPull && ConfirmEntry(PERIOD_M5, true, true))
       return EnterOrStackPosition(0, true);
-   if(sellPull && ConfirmEntry(PERIOD_M5, false, false))
+   if(sellPull && ConfirmEntry(PERIOD_M5, false, true))
       return EnterOrStackPosition(0, false);
    return false;
 }
@@ -1446,8 +1894,8 @@ bool TryS1_TrendFollow()
 // ===================== S2 Pullback EMA H1 =====================
 bool TryS2_PullbackEMA()
 {
-   int iH1 = TFIdx(PERIOD_H1); int iM15 = TFIdx(PERIOD_M15);
-   if(iH1<0 || iM15<0 || !g_tf[iH1].valid || !g_tf[iM15].valid) return false;
+   int iH1 = TFIdx(PERIOD_H1);
+   if(iH1 < 0 || !g_tf[iH1].valid) return false;
 
    double cl1H = g_tf[iH1].close1;
    double op1H = g_tf[iH1].open1;
@@ -1456,14 +1904,17 @@ bool TryS2_PullbackEMA()
    bool inUp = g_h1TrendUp && (cl1H > g_tf[iH1].ema50);
    bool inDn = g_h1TrendDn && (cl1H < g_tf[iH1].ema50);
 
+   // RSI H1 en zona sana para dirección — NO usar M15 RSI para estrategia H1
    bool touchUp = inUp && g_tf[iH1].low1  <= e20H && cl1H > e20H && cl1H > op1H
-                  && g_tf[iM15].rsi > 50 && g_tf[iM15].close1 > g_tf[iM15].ema21;
+                  && g_tf[iH1].rsi >= 40 && g_tf[iH1].rsi <= 65
+                  && g_adxH1 > 20;
    bool touchDn = inDn && g_tf[iH1].high1 >= e20H && cl1H < e20H && cl1H < op1H
-                  && g_tf[iM15].rsi < 50 && g_tf[iM15].close1 < g_tf[iM15].ema21;
+                  && g_tf[iH1].rsi >= 35 && g_tf[iH1].rsi <= 60
+                  && g_adxH1 > 20;
 
-   if(touchUp && ConfirmEntry(PERIOD_H1, true, false))
+   if(touchUp && ConfirmEntry(PERIOD_H1, true, true))
       return EnterOrStackPosition(1, true);
-   if(touchDn && ConfirmEntry(PERIOD_H1, false, false))
+   if(touchDn && ConfirmEntry(PERIOD_H1, false, true))
       return EnterOrStackPosition(1, false);
    return false;
 }
@@ -1502,21 +1953,23 @@ bool TryS3_LondonORB()
    if(!g_orbBuilt) return false;
    if(dt.hour > 10) return false;
 
-   double buf = g_tf[iM5].atr * 0.10;  // 0.15→0.10: entrada más cercana al nivel
+   double buf = g_tf[iM5].atr * 0.25;  // buffer 0.25 ATR — filtro falsos breaks ORB
    double cl1 = g_tf[iM5].close1;
    bool breakUp = !g_orbFiredLong  && cl1 > g_orbHi + buf
+                  && g_adxM15 > 18                             // momentum M15 confirmado pre-break
                   && g_tf[iM5].close1 > g_tf[iM5].open1
                   && g_tf[iM5].ema9 > g_tf[iM5].ema21
-                  && g_tf[iM5].mfi > 52;  // confirmación de volumen comprador
+                  && g_tf[iM5].mfi > 52;
    bool breakDn = !g_orbFiredShort && cl1 < g_orbLo - buf
+                  && g_adxM15 > 18                             // momentum M15 confirmado pre-break
                   && g_tf[iM5].close1 < g_tf[iM5].open1
                   && g_tf[iM5].ema9 < g_tf[iM5].ema21
-                  && g_tf[iM5].mfi < 48;  // confirmación de volumen vendedor
+                  && g_tf[iM5].mfi < 48;
 
    if(breakUp && ConfirmEntry(PERIOD_M5, true, false))
-      { g_orbFiredLong  = true; return EnterOrStackPosition(2, true);  }
+      { if(!g_evalMode) g_orbFiredLong  = true; return EnterOrStackPosition(2, true);  }
    if(breakDn && ConfirmEntry(PERIOD_M5, false, false))
-      { g_orbFiredShort = true; return EnterOrStackPosition(2, false); }
+      { if(!g_evalMode) g_orbFiredShort = true; return EnterOrStackPosition(2, false); }
    return false;
 }
 
@@ -1571,9 +2024,9 @@ bool TryS4_NYSession()
                   && g_tf[iM5].rsi < 50;
 
    if(breakUp && ConfirmEntry(PERIOD_M5, true, false))
-      { g_nyFiredLong  = true; return EnterOrStackPosition(3, true);  }
+      { if(!g_evalMode) g_nyFiredLong  = true; return EnterOrStackPosition(3, true);  }
    if(breakDn && ConfirmEntry(PERIOD_M5, false, false))
-      { g_nyFiredShort = true; return EnterOrStackPosition(3, false); }
+      { if(!g_evalMode) g_nyFiredShort = true; return EnterOrStackPosition(3, false); }
    return false;
 }
 
@@ -1586,17 +2039,21 @@ bool   g_asFiredLong = false, g_asFiredShort = false;
 bool TryS5_AsianRange()
 {
    MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
-   datetime today = g_lastDay;
-   if(today != g_asLastReset)
+   // Sesión asiática cruza medianoche (22:00-05:00 GMT).
+   // Usar D1[1] como session-date cuando hora < 6 — evita que el
+   // reset diario de medianoche borre el range construido 22:00-23:59.
+   datetime asSessionDate = (dt.hour < 6) ? iTime(_Symbol, PERIOD_D1, 1)
+                                          : g_lastDay;
+   if(asSessionDate != g_asLastReset)
    {
-      g_asLastReset = today;
+      g_asLastReset = asSessionDate;
       g_asHi = 0; g_asLo = DBL_MAX; g_asBuilt = false;
       g_asFiredLong = false; g_asFiredShort = false;
    }
    int iM5 = TFIdx(PERIOD_M5); if(iM5<0 || !g_tf[iM5].valid) return false;
 
-   bool inRange = (dt.hour >= 22 || dt.hour < 1);
-   bool inTrade = (dt.hour >= 1  && dt.hour < 5);
+   bool inRange = (dt.hour == 22 || dt.hour == 23);  // build: solo 22:00-00:00 (2h exactas)
+   bool inTrade = (dt.hour >= 0  && dt.hour < 5);    // trade: 00:00-05:00 incluye medianoche
 
    if(inRange)
    {
@@ -1611,36 +2068,51 @@ bool TryS5_AsianRange()
    }
    if(!g_asBuilt || !inTrade) return false;
 
-   double mid = (g_asHi + g_asLo) / 2.0;
    double cl1 = g_tf[iM5].close1;
    double buf = g_tf[iM5].atr * 0.18;
+   // Sesgo LONG — oro tiene tendencia secular alcista (QQ: "most trades BUY")
+   // Short asiático solo permitido cuando D1 es bajista o ADX confirma impulso bajista
+   bool shortBiasOk = g_d1TrendDn || (g_adxH1 > 18 && !g_d1TrendUp);
    bool breakUp = !g_asFiredLong  && cl1 > g_asHi + buf;
-   bool breakDn = !g_asFiredShort && cl1 < g_asLo - buf;
+   bool breakDn = !g_asFiredShort && cl1 < g_asLo - buf && shortBiasOk;
 
    if(breakUp && ConfirmEntry(PERIOD_M5, true, false))
-      { g_asFiredLong  = true; return EnterOrStackPosition(4, true);  }
+      { if(!g_evalMode) g_asFiredLong  = true; return EnterOrStackPosition(4, true);  }
    if(breakDn && ConfirmEntry(PERIOD_M5, false, false))
-      { g_asFiredShort = true; return EnterOrStackPosition(4, false); }
+      { if(!g_evalMode) g_asFiredShort = true; return EnterOrStackPosition(4, false); }
    return false;
 }
 
 // ===================== S6 Mean Reversion BB =====================
 bool TryS6_MeanReversion()
 {
-   int iM5 = TFIdx(PERIOD_M5); int iM15 = TFIdx(PERIOD_M15);
-   if(iM5<0 || iM15<0 || !g_tf[iM5].valid || !g_tf[iM15].valid) return false;
+   // Bloquear mean reversion si mercado está en tendencia — ADX>20 más estricto
+   if(g_adxH1 > 20) return false;
+   int iM5 = TFIdx(PERIOD_M5);
+   if(iM5 < 0 || !g_tf[iM5].valid) return false;
 
    double cl1 = g_tf[iM5].close1;
    double hi1 = g_tf[iM5].high1;
    double lo1 = g_tf[iM5].low1;
 
-   // Bounce from lower BB
-   bool bounceUp = lo1 <= g_tf[iM5].bbDn && cl1 > g_tf[iM5].bbDn && cl1 > g_tf[iM5].open1
-                   && g_tf[iM5].rsi < 35 && g_tf[iM15].rsi < 45;
-   bool bounceDn = hi1 >= g_tf[iM5].bbUp && cl1 < g_tf[iM5].bbUp && cl1 < g_tf[iM5].open1
-                   && g_tf[iM5].rsi > 65 && g_tf[iM15].rsi > 55;
+   // Divergencia RSI — copia RSI para bars [1] y [2] del M5
+   double rsiArr[3];
+   if(CopyBuffer(hRSI[iM5], 0, 0, 3, rsiArr) < 3) return false;
+   double rsi1 = rsiArr[1];   // RSI vela cerrada
+   double rsi2 = rsiArr[2];   // RSI vela anterior
 
-   // Mean reversion: no requiere strike (no buscamos break), solo candle reversal
+   // Divergencia alcista: precio hace LOW2 > LOW1 pero RSI NO confirma (rsi1 > rsi2)
+   bool bullDiv = (lo1 < g_tf[iM5].low2) && (rsi1 > rsi2);
+   // Divergencia bajista: precio hace HIGH2 < HIGH1 pero RSI NO confirma (rsi1 < rsi2)
+   bool bearDiv = (hi1 > g_tf[iM5].high2) && (rsi1 < rsi2);
+
+   // Bounce de BB + divergencia confirmada — thresholds asimétricos por sesgo LONG en oro
+   bool bounceUp = lo1 <= g_tf[iM5].bbDn && cl1 > g_tf[iM5].bbDn && cl1 > g_tf[iM5].open1
+                   && rsi1 < 45 && bullDiv;   // longs: umbral relajado (45) — gold uptrend bias
+   bool bounceDn = hi1 >= g_tf[iM5].bbUp && cl1 < g_tf[iM5].bbUp && cl1 < g_tf[iM5].open1
+                   && rsi1 > 62 && bearDiv;   // shorts: umbral más estricto (62)
+
+   // Mean reversion: candle reversal + divergencia RSI confirmada
    if(bounceUp && ConfirmEntry(PERIOD_M5, true, false))   return EnterOrStackPosition(5, true);
    if(bounceDn && ConfirmEntry(PERIOD_M5, false, false))  return EnterOrStackPosition(5, false);
    return false;
@@ -1658,13 +2130,13 @@ bool TryS7_StructureBreak()
       swingL = MathMin(swingL, iLow(_Symbol,  PERIOD_H1, k));
    }
    double cl1 = g_tf[iH1].close1;
-   double buf = g_tf[iH1].atr * 0.10;
+   double buf = g_tf[iH1].atr * 0.25;  // buffer ampliado — H1 XAUUSD requiere margen mayor
    bool brkUp = cl1 > swingH + buf && g_h1TrendUp && g_tf[iH1].ema9 > g_tf[iH1].ema21;
    bool brkDn = cl1 < swingL - buf && g_h1TrendDn && g_tf[iH1].ema9 < g_tf[iH1].ema21;
 
-   if(brkUp && ConfirmEntry(PERIOD_H1, true, false))
+   if(brkUp && ConfirmEntry(PERIOD_H1, true, true))
       return EnterOrStackPosition(6, true);
-   if(brkDn && ConfirmEntry(PERIOD_H1, false, false))
+   if(brkDn && ConfirmEntry(PERIOD_H1, false, true))
       return EnterOrStackPosition(6, false);
    return false;
 }
@@ -1705,12 +2177,16 @@ bool TryS9_MomentumM15()
    double body  = MathAbs(g_tf[iM15].close1 - g_tf[iM15].open1);
    bool bigBody = (g_tf[iM15].atr > 0) && (range > g_tf[iM15].atr * 1.2) && (body / MathMax(range,_Point) > 0.55);
 
-   bool spikeUp = bigBody && g_tf[iM15].close1 > g_tf[iM15].open1
+   // Continuación: vela [2] debe coincidir en dirección — no aceptar spikes aislados
+   bool c2up = g_tf[iM15].close2 > g_tf[iM15].open2;
+   bool c2dn = g_tf[iM15].close2 < g_tf[iM15].open2;
+
+   bool spikeUp = bigBody && g_tf[iM15].close1 > g_tf[iM15].open1 && c2up
                   && g_tf[iM15].rsi > 60 && g_tf[iH1].rsi > 50;
-   bool spikeDn = bigBody && g_tf[iM15].close1 < g_tf[iM15].open1
+   bool spikeDn = bigBody && g_tf[iM15].close1 < g_tf[iM15].open1 && c2dn
                   && g_tf[iM15].rsi < 40 && g_tf[iH1].rsi < 50;
 
-   // Momentum spike: la vela [1] ya es bigBody, no requiere strike adicional
+   // Momentum impulso: bigBody + continuación previa confirmada
    if(spikeUp && ConfirmEntry(PERIOD_M15, true, false))   return EnterOrStackPosition(8, true);
    if(spikeDn && ConfirmEntry(PERIOD_M15, false, false))  return EnterOrStackPosition(8, false);
    return false;
@@ -1728,8 +2204,12 @@ bool TryS10_CompressionBreak()
    if(squeezed) return false;
 
    double cl1 = g_tf[iM15].close1;
-   bool brkUp = cl1 > g_tf[iM15].bbUp && g_tf[iM15].rsi > 55;
-   bool brkDn = cl1 < g_tf[iM15].bbDn && g_tf[iM15].rsi < 45;
+   // ATR expanding confirma momentum real — BB expansion sola puede ser ruido
+   bool atrExpanding = (g_atrAvgM5 > 0) && (g_tf[iM15].atr > g_atrAvgM5 * 1.15);
+   bool brkUp = cl1 > g_tf[iM15].bbUp && g_tf[iM15].rsi > 55
+                && atrExpanding && g_tf[iM15].ema9 > g_tf[iM15].ema21;
+   bool brkDn = cl1 < g_tf[iM15].bbDn && g_tf[iM15].rsi < 45
+                && atrExpanding && g_tf[iM15].ema9 < g_tf[iM15].ema21;
 
    if(brkUp && ConfirmEntry(PERIOD_M15, true, false))   return EnterOrStackPosition(9, true);
    if(brkDn && ConfirmEntry(PERIOD_M15, false, false))  return EnterOrStackPosition(9, false);
@@ -1745,19 +2225,25 @@ bool TryS11_H1Continuation()
    bool inUp  = g_h1TrendUp && g_tf[iH1].close1 > g_tf[iH1].ema21;
    bool inDn  = g_h1TrendDn && g_tf[iH1].close1 < g_tf[iH1].ema21;
 
-   // Continuación: 2 velas H1 cerrando en dirección + M12 confirmando
-   double cl1 = g_tf[iH1].close1;
-   double cl2 = g_tf[iH1].close2;
-   bool contUp = inUp && cl1 > cl2 && g_tf[iH1].close1 > g_tf[iH1].open1
+   // Continuación desde EMA50 H1 — nivel estructural, no solo 2 velas consecutivas
+   double cl1  = g_tf[iH1].close1;
+   double cl2  = g_tf[iH1].close2;
+   double atrH = g_tf[iH1].atr;
+   // Precio retrocedió a zona EMA50 H1 (±0.3 ATR) y recuperó EMA21 — bounce estructural
+   bool bouncedUp = inUp && g_tf[iH1].low1  <= g_tf[iH1].ema50 + atrH * 0.3
+                    && cl1 > g_tf[iH1].ema21;
+   bool bouncedDn = inDn && g_tf[iH1].high1 >= g_tf[iH1].ema50 - atrH * 0.3
+                    && cl1 < g_tf[iH1].ema21;
+   bool contUp = bouncedUp && cl1 > cl2 && g_tf[iH1].close1 > g_tf[iH1].open1
                  && g_tf[iM12].close1 > g_tf[iM12].ema21
                  && g_tf[iM12].rsi > 50;
-   bool contDn = inDn && cl1 < cl2 && g_tf[iH1].close1 < g_tf[iH1].open1
+   bool contDn = bouncedDn && cl1 < cl2 && g_tf[iH1].close1 < g_tf[iH1].open1
                  && g_tf[iM12].close1 < g_tf[iM12].ema21
                  && g_tf[iM12].rsi < 50;
 
-   if(contUp && ConfirmEntry(PERIOD_H1, true, false))
+   if(contUp && ConfirmEntry(PERIOD_H1, true, true))
       return EnterOrStackPosition(10, true);
-   if(contDn && ConfirmEntry(PERIOD_H1, false, false))
+   if(contDn && ConfirmEntry(PERIOD_H1, false, true))
       return EnterOrStackPosition(10, false);
    return false;
 }
@@ -1922,6 +2408,31 @@ void ManagePositions()
             double curSL = PositionGetDouble(POSITION_SL);
             if(isLong  && newSL > curSL)               trade.PositionModify(t, newSL, tpPx);
             if(!isLong && (newSL < curSL || curSL==0)) trade.PositionModify(t, newSL, tpPx);
+         }
+      }
+
+      // ── 3b. HTF level proximity tightening ───────────────────────
+      // When price approaches PDH/PDL/week H-L against our position,
+      // tighten trail to ATR×0.6 to lock in gains before potential rejection.
+      if(rMove >= 0.8 && g_liq.nearHTFLevel)
+      {
+         int iM5h = TFIdx(PERIOD_M5);
+         if(iM5h >= 0 && g_tf[iM5h].valid)
+         {
+            double atrH  = g_tf[iM5h].atr;
+            double curH  = g_tf[iM5h].closeNow;
+            // Adverse: approaching PDH from below (long) or PDL from above (short)
+            bool htfAdverse = ( isLong && g_liq.pdh > 0 && curH > g_liq.pdh - atrH * 0.8)
+                           || (!isLong && g_liq.pdl > 0 && curH < g_liq.pdl + atrH * 0.8)
+                           || ( isLong && g_liq.weekHi > 0 && curH > g_liq.weekHi - atrH)
+                           || (!isLong && g_liq.weekLo > 0 && curH < g_liq.weekLo + atrH);
+            if(htfAdverse)
+            {
+               double tightSL  = isLong ? curPx - atrH * 0.60 : curPx + atrH * 0.60;
+               double curSLh   = PositionGetDouble(POSITION_SL);
+               if(isLong  && tightSL > curSLh)               trade.PositionModify(t, tightSL, tpPx);
+               if(!isLong && (tightSL < curSLh || curSLh==0)) trade.PositionModify(t, tightSL, tpPx);
+            }
          }
       }
 
@@ -2595,6 +3106,13 @@ void UpdateRecoveryEngine()
 void RunRecoveryEngine()
 {
    if(!g_recovActive)               return;
+   // Gate en bar-close M5 — evita stacking en cada tick
+   static datetime s_recovLastBar = 0;
+   int iM5r = TFIdx(PERIOD_M5);
+   if(iM5r < 0 || !g_tf[iM5r].valid) return;
+   datetime curBarM5 = g_tf[iM5r].barTime;
+   if(curBarM5 == s_recovLastBar)   return;
+   s_recovLastBar = curBarM5;
    if(!RecovL6_CapPreservOk())      return;
    if(!RecovL1_RegimeValid())       return;
    if(RecovL3_CanAddLayer())        RecovL3_AddLayer();
@@ -2728,6 +3246,9 @@ void DailyReset()
    g_growthHarvested     = false;
    g_growthSoftHarvested = false;
    if(g_recovActive) { CloseRecoveryPositions(); ResetRecovery(); }
+   // Reset liquidity context session hi/lo on new day
+   g_liq.sessionHi = 0;
+   g_liq.sessionLo = 0;
 }
 
 void CheckDayReset()
@@ -2975,7 +3496,7 @@ double CalcLot(double slDistPrice)
          {
             double slUSD_minL = slDistPrice * tickVal * minL / tickSz;
             double riskPctReal = (bal > 0) ? slUSD_minL / bal * 100.0 : 999.0;
-            double guardPct = (g_capMode == CAP_SMALL) ? 22.0 : 15.0;
+            double guardPct = (g_capMode == CAP_SMALL) ? 6.0 : 15.0;
             if(riskPctReal > guardPct) return 0;   // demasiado riesgo → no abrir
             lot = minL;
          }
@@ -3068,6 +3589,22 @@ void DrawPanel()
 
    PanelLabel(PNL_PREFIX+"L18", 16, y, StringFormat("Regime: %s [conf:%.0f%%]",
              RegimeStr(), g_regScore.confidence), RegimeColor(), InpPanelFontSize); y+=18;
+   double gGate = GlobalGateThreshold();
+   color  gScoreClr = (g_globalMarketScore >= gGate) ? clrLime
+                    : (g_globalMarketScore >= gGate*0.85) ? clrYellow : clrOrangeRed;
+   PanelLabel(PNL_PREFIX+"L18c", 16, y, StringFormat("Mkt Quality: %.0f / %.0f [%s]",
+              g_globalMarketScore, gGate,
+              g_globalMarketScore >= gGate ? "PASS" : "BLOCK"),
+              gScoreClr, InpPanelFontSize); y+=18;
+   // Tradability + Liquidity context row
+   color tradClr = g_marketTradable ? clrLime : clrOrangeRed;
+   string liqStr = StringFormat("PDH:%.1f PDL:%.1f %s%s",
+                   g_liq.pdh, g_liq.pdl,
+                   g_liq.nearHTFLevel  ? "[HTF!]" : "",
+                   g_liq.compressionState ? "[SQZ]" : (g_liq.expansionState ? "[EXP]" : ""));
+   PanelLabel(PNL_PREFIX+"L18d", 16, y, StringFormat("Tradable: %.0f [%s] | %s",
+              g_tradabilityScore, g_marketTradable ? "OK" : "NO", liqStr),
+              tradClr, InpPanelFontSize); y+=18;
    // Operating mode — destacado con color diferencial + progreso de milestone
    string opModeLabel;
    if(g_opMode == OPMODE_GROWTH)
