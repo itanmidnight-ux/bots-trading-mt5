@@ -1,11 +1,11 @@
 //+------------------------------------------------------------------+
-//|                     ScalpMaster Pro v3.0                        |
-//|  GMMA + SAR + ADX + Pivot Points — M1 Scalper / M15 Grid       |
+//|                     ScalpMaster Pro v3.3                        |
+//|  GMMA + SAR + ADX + Pivot Points + H1 SAR/MACD — M1/M15/H1    |
 //|      Metals (XAUUSD, XPTUSD) + Forex — MT5                     |
 //+------------------------------------------------------------------+
 #property copyright "ScalpMaster Pro"
-#property version   "3.20"
-#property description "GMMA/SAR/ADX/Pivot intelligent scalper — M1 & M15 | v3.2 max-profit trailing exit"
+#property version   "3.30"
+#property description "M1 Scalper | M15 Grid | H1 SAR+MACD — multi-TF intelligent bot"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -18,13 +18,15 @@
 enum ENUM_BOT_TF
 {
    BTF_M1  = 1,   // 1 Minute  (Scalper)
-   BTF_M15 = 15   // 15 Minutes (Grid)
+   BTF_M15 = 15,  // 15 Minutes (Grid)
+   BTF_H1  = 60   // 1 Hour (SAR+MACD strategy)
 };
 
 enum ENUM_BOT_STATE
 {
    STATE_IDLE,
-   STATE_MA_CROSS,
+   STATE_MA_CROSS,    // SMA cross detected (M1/M15 path)
+   STATE_MACD_CROSS,  // MACD(Open)+H1SAR cross detected (all TFs)
    STATE_IN_TRADE,
    STATE_WAIT_EMA
 };
@@ -77,6 +79,13 @@ input  int             InpADXPeriod      = 14;         // ADX Period
 input  double          InpADXMinLevel    = 20.0;       // Min ADX to enter (>20 = trend)
 input  double          InpADXExitLevel   = 28.0;       // ADX level to watch for peak exit
 
+sinput string          _SH1STR_ = "─────── H1 SAR+MACD STRATEGY ───────";
+input  bool            InpUseH1Strategy  = true;       // Enable H1 SAR+MACD strategy (all TFs)
+input  double          InpH1SARStep      = 0.01;       // H1 SAR Step (slow & reliable)
+input  double          InpH1SARMax       = 0.1;        // H1 SAR Maximum
+input  int             InpH1WaitBars     = 2;          // Extra bars to wait before H1 entry
+input  double          InpH1MinProfit    = 0.50;       // Min USD profit for H1 breakeven
+
 sinput string          _S5_ = "─────── RISK MANAGEMENT ───────";
 input  bool            InpAutoLot        = true;       // Auto Lot by Balance
 input  double          InpScaleBase      = 15.0;       // Balance ($) where lot scaling starts (<base → 0.01)
@@ -111,11 +120,13 @@ CAccountInfo    AcctInfo;
 CSymbolInfo     SymInfo;
 
 int    hMAFast, hMASlow, hEMAFast, hEMASlow, hRSI;
-int    hMACD;                  // MACD on botTF
-int    hSAR;                   // Parabolic SAR
+int    hMACD;                  // MACD(Close) on botTF — existing strategy
+int    hSAR;                   // Parabolic SAR on botTF
 int    hADX;                   // ADX (trend strength)
 int    hGMMAShort[6];          // GMMA short group EMAs: 3,5,8,10,12,15
 int    hGMMALong[6];           // GMMA long  group EMAs: 30,35,40,45,50,60
+int    hSAR_H1     = INVALID_HANDLE; // SAR(0.01,0.1) on H1 — H1 direction for all TFs
+int    hMACD_Open  = INVALID_HANDLE; // MACD(Open) on botTF — H1 strategy cross detection
 // hM15Fast/hM15Slow kept as INVALID_HANDLE (replaced by SAR)
 int    hM15Fast = INVALID_HANDLE, hM15Slow = INVALID_HANDLE;
 
@@ -132,6 +143,8 @@ int             barCounter   = 0;
 int             maCrossBar   = -1;
 bool            maDir        = false;    // true=bullish
 int             emaCrossBar  = -1;
+int             macdCrossBar = -1;       // bar when MACD(Open)+H1SAR cross was detected
+bool            macdCrossDir = false;    // true=bullish MACD cross
 bool            emaArrived   = false;
 int             entryBar     = -1;
 int             tpStartBar   = -1;
@@ -177,6 +190,7 @@ int GetRSIPeriod()
    {
       case PERIOD_M1:  return 7;
       case PERIOD_M15: return 14;
+      case PERIOD_H1:  return 14;
       default:         return 14;
    }
 }
@@ -190,6 +204,7 @@ ENUM_TIMEFRAMES BotTFtoPeriod(ENUM_BOT_TF tf)
    {
       case BTF_M1:  return PERIOD_M1;
       case BTF_M15: return PERIOD_M15;
+      case BTF_H1:  return PERIOD_H1;
       default:      return PERIOD_M1;
    }
 }
@@ -200,6 +215,7 @@ string TFName(ENUM_BOT_TF tf)
    {
       case BTF_M1:  return "M1 (Scalper)";
       case BTF_M15: return "M15 (Grid)";
+      case BTF_H1:  return "H1 (SAR+MACD)";
       default:      return "??";
    }
 }
@@ -333,10 +349,17 @@ bool InitIndicators()
    hM15Fast = INVALID_HANDLE;
    hM15Slow = INVALID_HANDLE;
 
+   // H1 SAR — slow params (0.01, 0.1) for H1 direction on all TFs
+   hSAR_H1 = iSAR(_Symbol, PERIOD_H1, InpH1SARStep, InpH1SARMax);
+
+   // MACD(Open) on botTF — H1 strategy cross signal
+   hMACD_Open = iMACD(_Symbol, botTF, InpMACDFast, InpMACDSlow, InpMACDSignal, PRICE_OPEN);
+
    if(hMAFast == INVALID_HANDLE || hMASlow  == INVALID_HANDLE ||
       hEMAFast== INVALID_HANDLE || hEMASlow == INVALID_HANDLE ||
       hRSI    == INVALID_HANDLE || hMACD    == INVALID_HANDLE ||
-      hSAR    == INVALID_HANDLE || hADX     == INVALID_HANDLE)
+      hSAR    == INVALID_HANDLE || hADX     == INVALID_HANDLE ||
+      hSAR_H1 == INVALID_HANDLE || hMACD_Open == INVALID_HANDLE)
    {
       Alert("ScalpMaster: Critical indicator handle creation failed!");
       return false;
@@ -591,6 +614,99 @@ bool ADXExhausting()
    bool nowFalling = adxBuf[1] < adxBuf[2];
    bool wasHigh    = adxBuf[2] >= InpADXExitLevel;
    return wasRising && nowFalling && wasHigh;
+}
+
+//+------------------------------------------------------------------+
+//| H1 SAR DIRECTION — uses slow params (0.01, 0.1)                 |
+//+------------------------------------------------------------------+
+bool SARH1Bull()
+{
+   double sarBuf[]; MqlRates bars[];
+   ArraySetAsSeries(sarBuf, true); ArraySetAsSeries(bars, true);
+   if(CopyBuffer(hSAR_H1, 0, 0, 2, sarBuf) < 2) return true;
+   if(CopyRates(_Symbol, PERIOD_H1, 0, 2, bars) < 2) return true;
+   return sarBuf[1] < bars[1].close;   // SAR below close = H1 bullish
+}
+
+bool SARH1Bear()
+{
+   double sarBuf[]; MqlRates bars[];
+   ArraySetAsSeries(sarBuf, true); ArraySetAsSeries(bars, true);
+   if(CopyBuffer(hSAR_H1, 0, 0, 2, sarBuf) < 2) return true;
+   if(CopyRates(_Symbol, PERIOD_H1, 0, 2, bars) < 2) return true;
+   return sarBuf[1] > bars[1].close;   // SAR above close = H1 bearish
+}
+
+// Returns true when H1 SAR just flipped against the open position
+bool SARH1FlippedAgainst()
+{
+   if(!HasPosition()) return false;
+   double sarBuf[]; MqlRates bars[];
+   ArraySetAsSeries(sarBuf, true); ArraySetAsSeries(bars, true);
+   if(CopyBuffer(hSAR_H1, 0, 0, 3, sarBuf) < 3) return false;
+   if(CopyRates(_Symbol, PERIOD_H1, 0, 3, bars) < 3) return false;
+   bool prevBull = sarBuf[2] < bars[2].close;
+   bool currBear = sarBuf[1] > bars[1].close;
+   bool prevBear = sarBuf[2] > bars[2].close;
+   bool currBull = sarBuf[1] < bars[1].close;
+   if(isBuy  && prevBull && currBear) return true;
+   if(!isBuy && prevBear && currBull) return true;
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| MACD(OPEN) CROSS — H1 strategy entry + exit signals             |
+//+------------------------------------------------------------------+
+// Bullish cross: MACD line crossed above signal on bar[1]
+bool MACDOpenCrossBull()
+{
+   double macd[], signal[];
+   ArraySetAsSeries(macd, true); ArraySetAsSeries(signal, true);
+   if(CopyBuffer(hMACD_Open, 0, 0, 3, macd)   < 3) return false;
+   if(CopyBuffer(hMACD_Open, 1, 0, 3, signal) < 3) return false;
+   return (macd[2]-signal[2]) < 0 && (macd[1]-signal[1]) > 0;
+}
+
+// Bearish cross: MACD line crossed below signal on bar[1]
+bool MACDOpenCrossBear()
+{
+   double macd[], signal[];
+   ArraySetAsSeries(macd, true); ArraySetAsSeries(signal, true);
+   if(CopyBuffer(hMACD_Open, 0, 0, 3, macd)   < 3) return false;
+   if(CopyBuffer(hMACD_Open, 1, 0, 3, signal) < 3) return false;
+   return (macd[2]-signal[2]) > 0 && (macd[1]-signal[1]) < 0;
+}
+
+// Returns true when MACD crossed AGAINST the open position (exit signal)
+bool MACDOpenCrossAgainst()
+{
+   if(!HasPosition()) return false;
+   double macd[], signal[];
+   ArraySetAsSeries(macd, true); ArraySetAsSeries(signal, true);
+   if(CopyBuffer(hMACD_Open, 0, 0, 3, macd)   < 3) return false;
+   if(CopyBuffer(hMACD_Open, 1, 0, 3, signal) < 3) return false;
+   if(isBuy)  return (macd[2]-signal[2]) > 0 && (macd[1]-signal[1]) < 0;
+   if(!isBuy) return (macd[2]-signal[2]) < 0 && (macd[1]-signal[1]) > 0;
+   return false;
+}
+
+// Current MACD direction (above/below signal = bull/bear) — used as filter
+bool MACDOpenBull()
+{
+   double macd[], signal[];
+   ArraySetAsSeries(macd, true); ArraySetAsSeries(signal, true);
+   if(CopyBuffer(hMACD_Open, 0, 0, 2, macd)   < 2) return true;
+   if(CopyBuffer(hMACD_Open, 1, 0, 2, signal) < 2) return true;
+   return (macd[1]-signal[1]) > 0;
+}
+
+bool MACDOpenBear()
+{
+   double macd[], signal[];
+   ArraySetAsSeries(macd, true); ArraySetAsSeries(signal, true);
+   if(CopyBuffer(hMACD_Open, 0, 0, 2, macd)   < 2) return true;
+   if(CopyBuffer(hMACD_Open, 1, 0, 2, signal) < 2) return true;
+   return (macd[1]-signal[1]) < 0;
 }
 
 //+------------------------------------------------------------------+
@@ -901,6 +1017,96 @@ void ManageGridTP(int bar)
 }
 
 //+------------------------------------------------------------------+
+//| MANAGE H1 EXIT — H1 SAR trailing + MACD reversal + ADX peak    |
+//| H1 trades last hours; wait patiently for full move to develop.  |
+//+------------------------------------------------------------------+
+void ManageH1Exit(int bar)
+{
+   ulong t;
+   if(!FindPosition(t))
+   {
+      // Auto-closed by MT5 — recover stats
+      if(HistorySelect(TimeCurrent() - 7200, TimeCurrent()))
+      {
+         int deals = HistoryDealsTotal();
+         for(int i = deals - 1; i >= 0; i--)
+         {
+            ulong dk = HistoryDealGetTicket(i);
+            if(HistoryDealGetInteger(dk, DEAL_MAGIC) == MAGIC &&
+               HistoryDealGetInteger(dk, DEAL_ENTRY) == DEAL_ENTRY_OUT)
+            {
+               double dp = HistoryDealGetDouble(dk, DEAL_PROFIT)
+                         + HistoryDealGetDouble(dk, DEAL_SWAP)
+                         + HistoryDealGetDouble(dk, DEAL_COMMISSION);
+               statProfit += dp;
+               if(dp > 0) statWins++;
+               break;
+            }
+         }
+      }
+      posTicket=0; openLot=0; beMoveDone=false; gridLevel=0; trailSL=0;
+      botStatus="IDLE"; statusClr=CLR_GRAY;
+      botState=STATE_IDLE; emaArrived=false;
+      return;
+   }
+
+   double profit = GetProfit();
+   double pt     = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+
+   // ── PHASE 1: Breakeven once minimum H1 profit reached ─────────────
+   if(!beMoveDone && profit >= InpH1MinProfit)
+   {
+      double beSL = NormalizeDouble(entryPrice + (isBuy ? pt*5 : -pt*5), _Digits);
+      UpdateSL(beSL);
+      beMoveDone = true;
+      Print("H1: BE locked. Profit=", DoubleToString(profit,2));
+   }
+
+   // ── PHASE 2: Trail SL using H1 SAR (locks in profit per H1 bar) ──
+   if(beMoveDone)
+   {
+      double sarBuf[];
+      ArraySetAsSeries(sarBuf, true);
+      if(CopyBuffer(hSAR_H1, 0, 0, 2, sarBuf) >= 2)
+      {
+         long   slvl    = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+         double minDist = (slvl + 2) * pt;
+         double sar     = sarBuf[1];
+         double bid     = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         double ask     = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+         if(isBuy  && sar > entryPrice && sar < bid - minDist)
+            UpdateSL(NormalizeDouble(sar, _Digits));
+         if(!isBuy && sar < entryPrice && sar > ask + minDist)
+            UpdateSL(NormalizeDouble(sar, _Digits));
+      }
+   }
+
+   // ── EXIT A: H1 SAR flipped against position ───────────────────────
+   if(SARH1FlippedAgainst())
+   {
+      Print("H1: SAR flip exit. Profit=", DoubleToString(profit,2));
+      CloseTrade(); botState=STATE_IDLE; emaArrived=false;
+      return;
+   }
+
+   // ── EXIT B: MACD(Open) crossed in reverse — entry signal reversed ─
+   if(MACDOpenCrossAgainst() && profit >= 0)
+   {
+      Print("H1: MACD reverse cross exit. Profit=", DoubleToString(profit,2));
+      CloseTrade(); botState=STATE_IDLE; emaArrived=false;
+      return;
+   }
+
+   // ── EXIT C: ADX exhausted + GMMA converging — trend peak ─────────
+   if(ADXExhausting() && !GMMALongExpanding(isBuy) && profit >= InpH1MinProfit)
+   {
+      Print("H1: ADX peak + GMMA convergence exit. Profit=", DoubleToString(profit,2));
+      CloseTrade(); botState=STATE_IDLE; emaArrived=false;
+      return;
+   }
+}
+
+//+------------------------------------------------------------------+
 //| MAIN SIGNAL LOGIC (on new bar only)                              |
 //+------------------------------------------------------------------+
 void ProcessBar(int bar)
@@ -929,10 +1135,11 @@ void ProcessBar(int bar)
 
       switch(botState)
       {
-         //--- IDLE: detect MA cross
+         //--- IDLE: detect entry signal (PATH A = MA cross for M1/M15; PATH B = MACD+H1SAR)
          case STATE_IDLE:
          {
-            if(maCrossUp || mcDn)
+            // PATH A: MA/EMA cross strategy — M1 and M15 only
+            if(botTF != PERIOD_H1 && (maCrossUp || mcDn))
             {
                maCrossBar = bar - 1;
                maDir      = maCrossUp;
@@ -941,6 +1148,72 @@ void ProcessBar(int bar)
                emaArrived = false;
                emaCrossBar= -1;
                Print("MA Cross @ bar", maCrossBar, " ", maDir?"UP":"DOWN");
+               break;   // PATH A takes priority; skip PATH B this bar
+            }
+
+            // PATH B: MACD(Open) cross + H1 SAR direction — all TFs
+            if(InpUseH1Strategy)
+            {
+               bool macdBull = MACDOpenCrossBull();
+               bool macdBear = MACDOpenCrossBear();
+               if(macdBull || macdBear)
+               {
+                  bool sarH1Ok = macdBull ? SARH1Bull() : SARH1Bear();
+                  if(sarH1Ok)
+                  {
+                     macdCrossBar = bar - 1;
+                     macdCrossDir = macdBull;
+                     botState     = STATE_MACD_CROSS;
+                     lastSignal   = macdBull ? "MACD+SAR ▲" : "MACD+SAR ▼";
+                     Print("MACD+H1SAR @ bar", macdCrossBar, " ", macdCrossDir?"BUY":"SELL");
+                  }
+               }
+            }
+            break;
+         }
+
+         //--- MACD cross + H1 SAR: wait for entry bar then check filters
+         case STATE_MACD_CROSS:
+         {
+            // Timeout: H1 gets more wait time (bars = H1 bars)
+            int macdMaxWait = (botTF == PERIOD_H1) ? 5 : 3;
+            if(bar > macdCrossBar + macdMaxWait)
+            {
+               Print("MACD cross timeout. Reset to IDLE.");
+               botState = STATE_IDLE;
+               break;
+            }
+            // Minimum wait before entry: H1 needs more reaction time
+            int waitBars = (botTF == PERIOD_H1) ? InpH1WaitBars : 1;
+            if(bar >= macdCrossBar + waitBars)
+            {
+               // Verify MACD + H1 SAR still aligned (not flipped back)
+               bool macdStillOk = macdCrossDir ? MACDOpenBull() : MACDOpenBear();
+               bool sarH1StillOk= macdCrossDir ? SARH1Bull()    : SARH1Bear();
+               bool rsiOk   = macdCrossDir ? RSIOKBuy()        : RSIOKSell();
+               bool adxOk   = ADXStrong();
+               bool volOk   = VolumeOK();
+               bool gmmaOk  = macdCrossDir ? GMMATrendingBuy() : GMMATrendingSell();
+               if(!macdStillOk || !sarH1StillOk || !rsiOk || !adxOk || !volOk || !gmmaOk)
+               {
+                  Print("MACD entry blocked @ bar ", bar,
+                        " MACD:", macdStillOk, " SARH1:", sarH1StillOk,
+                        " RSI:", rsiOk, " ADX:", adxOk, " Vol:", volOk, " GMMA:", gmmaOk);
+                  if(bar > macdCrossBar + macdMaxWait - 1)
+                  { Print("MACD entry timeout. Reset."); botState = STATE_IDLE; }
+                  break;
+               }
+               bool opened = OpenTrade(macdCrossDir);
+               if(opened)
+               {
+                  entryBar   = bar;
+                  tpStartBar = bar + 2;
+                  emaArrived = true;   // no WAIT_EMA for this path
+                  botState   = STATE_IN_TRADE;
+                  Print("MACD strategy entry: ", macdCrossDir?"BUY":"SELL",
+                        " TF=", TFName(InpTimeframe));
+               }
+               else botState = STATE_IDLE;
             }
             break;
          }
@@ -1037,11 +1310,13 @@ void ProcessBar(int bar)
             break;
          }
 
-         //--- In trade: M1 scalper exits (SAR/ADX/GMMA), M15 grid TP
+         //--- In trade: M1=scalper exit, M15=grid TP, H1=H1 SAR+MACD exit
          case STATE_IN_TRADE:
          {
             if(botTF == PERIOD_M1)
                ManageScalperExit(bar);
+            else if(botTF == PERIOD_H1)
+               ManageH1Exit(bar);
             else
                ManageGridTP(bar);
             // Edge case: position gone but state not reset inside manager
@@ -1106,7 +1381,7 @@ void CreatePanel()
    ObjRect("bg",     x,   y,   w,   h,   CLR_BG,    CLR_BORDER);
    // Title bar
    ObjRect("hdr",    x+1, y+1, w-2, 28, CLR_HDR,   CLR_BORDER);
-   ObjLabel("title", x+10, y+9, "⚡ ScalpMaster Pro v3.2", CLR_TITLE, 9, "Consolas Bold");
+   ObjLabel("title", x+10, y+9, "⚡ ScalpMaster Pro v3.3", CLR_TITLE, 9, "Consolas Bold");
 
    // Section: Account
    ObjRect("sgacct",  x+1,  y+35, w-2, 18, C'22,28,50');
@@ -1215,9 +1490,13 @@ void UpdatePanel()
    color pnlClr  = pnl > 0 ? CLR_GREEN : (pnl < 0 ? CLR_RED : CLR_GRAY);
    UpdateLabel("val_pnl", DoubleToString(pnl,2)+" "+cur, pnlClr);
 
-   string modeStr = botTF==PERIOD_M1
-      ? "SCALP Trail="+(beMoveDone?"SAR":"WAIT BE")
-      : "GRID "+IntegerToString(gridLevel)+"/"+IntegerToString(InpGridLevels);
+   string modeStr;
+   if(botTF == PERIOD_M1)
+      modeStr = "SCALP Trail="+(beMoveDone?"SAR":"WAIT BE");
+   else if(botTF == PERIOD_H1)
+      modeStr = "H1 SAR+MACD BE="+(beMoveDone?"SET":"WAIT");
+   else
+      modeStr = "GRID "+IntegerToString(gridLevel)+"/"+IntegerToString(InpGridLevels);
    UpdateLabel("val_grd", modeStr, CLR_WHITE);
 
    // Stats
@@ -1273,8 +1552,10 @@ void OnDeinit(const int reason)
    IndicatorRelease(hEMASlow);
    IndicatorRelease(hRSI);
    IndicatorRelease(hMACD);
-   if(hSAR != INVALID_HANDLE) IndicatorRelease(hSAR);
-   if(hADX != INVALID_HANDLE) IndicatorRelease(hADX);
+   if(hSAR      != INVALID_HANDLE) IndicatorRelease(hSAR);
+   if(hADX      != INVALID_HANDLE) IndicatorRelease(hADX);
+   if(hSAR_H1   != INVALID_HANDLE) IndicatorRelease(hSAR_H1);
+   if(hMACD_Open!= INVALID_HANDLE) IndicatorRelease(hMACD_Open);
    for(int i = 0; i < 6; i++)
    {
       if(hGMMAShort[i] != INVALID_HANDLE) IndicatorRelease(hGMMAShort[i]);
