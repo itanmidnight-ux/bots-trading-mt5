@@ -47,17 +47,27 @@ sinput string          _S2_ = "─────── EMA SETTINGS ────�
 input  int             InpEMAFast     = 9;             // EMA Fast Period
 input  int             InpEMASlow     = 26;            // EMA Slow Period
 
+sinput string          _S2B_ = "─────── ENTRY CONFIRMATION ───────";
+input  bool            InpEMARequiredM1  = true;        // Require EMA confirm on M1
+input  int             InpEMAMaxWaitBars = 5;           // Max bars to wait for EMA (M1)
+
 sinput string          _S3_ = "─────── RSI SETTINGS ───────";
 input  bool            InpRSIAuto     = true;          // Auto RSI Period by TF
 input  int             InpRSIPeriod   = 14;            // RSI Period (manual)
-input  double          InpRSIOB       = 70.0;          // RSI Overbought
-input  double          InpRSIOS       = 30.0;          // RSI Oversold
+input  double          InpRSIOB       = 65.0;          // RSI Overbought (max BUY)
+input  double          InpRSIOS       = 35.0;          // RSI Oversold (min SELL)
+input  double          InpRSIMinBuy   = 40.0;          // RSI Minimum for BUY
+input  double          InpRSIMaxSell  = 60.0;          // RSI Maximum for SELL
 
 sinput string          _S4_ = "─────── RISK MANAGEMENT ───────";
 input  bool            InpAutoLot     = true;          // Auto Lot by Balance
 input  double          InpLotPer100   = 0.01;          // Lot per $100 balance
 input  double          InpMinLot      = 0.01;          // Min Lot
 input  double          InpMaxLot      = 5.0;           // Max Lot
+input  bool            InpUseSL       = true;          // Enable Stop Loss on entry
+input  int             InpSLATRPeriod = 14;            // ATR Period (M1 adaptive SL)
+input  double          InpSLATRMult   = 1.5;           // ATR Multiplier (M1 SL)
+input  double          InpSLFixedPts  = 300.0;         // Fixed SL points×10 (M15+)
 
 sinput string          _S5_ = "─────── GRID TP ───────";
 input  double          InpGridPts     = 15.0;          // Grid Step (points ×10)
@@ -78,7 +88,7 @@ CPositionInfo   PosInfo;
 CAccountInfo    AcctInfo;
 CSymbolInfo     SymInfo;
 
-int    hMAFast, hMASlow, hEMAFast, hEMASlow, hRSI;
+int    hMAFast, hMASlow, hEMAFast, hEMASlow, hRSI, hATR;
 
 ENUM_TIMEFRAMES botTF;
 ENUM_BOT_STATE  botState     = STATE_IDLE;
@@ -195,6 +205,32 @@ double NormLot(double lot)
 }
 
 //+------------------------------------------------------------------+
+//| STOP LOSS CALCULATION                                            |
+//+------------------------------------------------------------------+
+double CalcSL(bool buy, double entry)
+{
+   if(!InpUseSL) return 0;
+   double pt = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double slDist;
+
+   if(botTF == PERIOD_M1)
+   {
+      double atrBuf[];
+      ArraySetAsSeries(atrBuf, true);
+      if(CopyBuffer(hATR, 0, 0, 2, atrBuf) < 2)
+         slDist = InpSLFixedPts * pt * 10.0;
+      else
+         slDist = atrBuf[1] * InpSLATRMult;
+   }
+   else
+   {
+      slDist = InpSLFixedPts * pt * 10.0;
+   }
+
+   return buy ? entry - slDist : entry + slDist;
+}
+
+//+------------------------------------------------------------------+
 //| INIT INDICATORS                                                  |
 //+------------------------------------------------------------------+
 bool InitIndicators()
@@ -204,12 +240,14 @@ bool InitIndicators()
    hEMAFast = iMA(_Symbol, botTF, InpEMAFast, 0, MODE_EMA, PRICE_CLOSE);
    hEMASlow = iMA(_Symbol, botTF, InpEMASlow, 0, MODE_EMA, PRICE_CLOSE);
    hRSI     = iRSI(_Symbol, botTF, GetRSIPeriod(), PRICE_CLOSE);
+   hATR     = iATR(_Symbol, botTF, InpSLATRPeriod);
 
    if(hMAFast  == INVALID_HANDLE ||
       hMASlow  == INVALID_HANDLE ||
       hEMAFast == INVALID_HANDLE ||
       hEMASlow == INVALID_HANDLE ||
-      hRSI     == INVALID_HANDLE)
+      hRSI     == INVALID_HANDLE ||
+      hATR     == INVALID_HANDLE)
    {
       Alert("ScalpMaster: Failed to create indicator handles!");
       return false;
@@ -268,8 +306,8 @@ bool IsNewBar()
 //+------------------------------------------------------------------+
 //| RSI FILTERS                                                      |
 //+------------------------------------------------------------------+
-bool RSIOKBuy()  { return GetRSI(1) < InpRSIOB; }
-bool RSIOKSell() { return GetRSI(1) > InpRSIOS; }
+bool RSIOKBuy()  { double r=GetRSI(1); return r >= InpRSIMinBuy  && r <= InpRSIOB; }
+bool RSIOKSell() { double r=GetRSI(1); return r <= InpRSIMaxSell && r >= InpRSIOS; }
 
 //+------------------------------------------------------------------+
 //| BUILD GRID LEVELS                                                |
@@ -318,9 +356,14 @@ double GetProfit()
 //+------------------------------------------------------------------+
 bool OpenTrade(bool buy)
 {
-   double lot = CalcLot();
-   bool   ok  = buy ? Trade.Buy(lot, _Symbol, 0, 0, 0, "SMP_BUY")
-                    : Trade.Sell(lot, _Symbol, 0, 0, 0, "SMP_SELL");
+   double lot       = CalcLot();
+   double askPrice  = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bidPrice  = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double openPrice = buy ? askPrice : bidPrice;
+   double sl        = CalcSL(buy, openPrice);
+
+   bool ok = buy ? Trade.Buy(lot,  _Symbol, 0, sl, 0, "SMP_BUY")
+                 : Trade.Sell(lot, _Symbol, 0, sl, 0, "SMP_SELL");
    if(!ok)
    { Print("OpenTrade failed: ", GetLastError()); return false; }
 
@@ -338,7 +381,8 @@ bool OpenTrade(bool buy)
    statTotal++;
    botStatus  = buy ? "LONG OPEN" : "SHORT OPEN";
    statusClr  = buy ? CLR_GREEN : CLR_RED;
-   Print("Trade opened: ", buy?"BUY":"SELL", " Lot=", lot, " Entry=", entryPrice);
+   Print("Trade opened: ", buy?"BUY":"SELL", " Lot=", lot,
+         " Entry=", entryPrice, " SL=", DoubleToString(sl, _Digits));
    return true;
 }
 
@@ -478,10 +522,10 @@ void ProcessBar(int bar)
             break;
          }
 
-         //--- MA seen: wait 2 bars, open on bar 2 after cross
+         //--- MA seen: wait for EMA (M1 required) or open after 2 bars (M15+)
          case STATE_MA_CROSS:
          {
-            // EMA confirmation check
+            // EMA confirmation check (always track regardless of TF)
             if((maDir && emaCUp) || (!maDir && emaCDn))
             {
                emaCrossBar = bar - 1;
@@ -490,8 +534,24 @@ void ProcessBar(int bar)
                Print("EMA cross pre-entry @ bar", emaCrossBar);
             }
 
-            // Entry on bar 2 after MA cross
-            if(bar >= maCrossBar + 2)
+            bool m1RequireEMA = (botTF == PERIOD_M1 && InpEMARequiredM1);
+
+            // M1 with required EMA: timeout if EMA never arrives
+            if(m1RequireEMA && bar > maCrossBar + InpEMAMaxWaitBars)
+            {
+               Print("M1 EMA wait timeout. Reset to IDLE.");
+               botState = STATE_IDLE;
+               break;
+            }
+
+            // Determine if we should attempt entry this bar
+            bool readyToEnter = false;
+            if(m1RequireEMA)
+               readyToEnter = emaArrived && bar >= emaCrossBar + 1;
+            else
+               readyToEnter = bar >= maCrossBar + 2;
+
+            if(readyToEnter)
             {
                bool rsiOk = maDir ? RSIOKBuy() : RSIOKSell();
                if(!rsiOk)
@@ -598,7 +658,7 @@ void CreatePanel()
 {
    if(!InpShowPanel) return;
    int x = InpPanelX, y = InpPanelY;
-   int w = 230, h = 370;
+   int w = 230, h = 390;
 
    // Background
    ObjRect("bg",     x,   y,   w,   h,   CLR_BG,    CLR_BORDER);
@@ -633,28 +693,30 @@ void CreatePanel()
    ObjLabel("val_rsi", x+120,y+198, "---",      CLR_WHITE, 8);
    ObjLabel("lbl_lot", x+8, y+214, "Lot Size:", CLR_GRAY, 8);
    ObjLabel("val_lot", x+120,y+214, "---",      CLR_WHITE, 8);
+   ObjLabel("lbl_slm", x+8, y+230, "SL Mode:",  CLR_GRAY, 8);
+   ObjLabel("val_slm", x+120,y+230, "---",      CLR_WHITE, 8);
 
    // Section: Trade Status
-   ObjRect("sgtrd",   x+1, y+235, w-2, 18, C'22,28,50');
-   ObjLabel("sgtrd_t",x+8, y+238, "TRADE STATUS", CLR_GRAY, 7);
+   ObjRect("sgtrd",   x+1, y+251, w-2, 18, C'22,28,50');
+   ObjLabel("sgtrd_t",x+8, y+254, "TRADE STATUS", CLR_GRAY, 7);
 
-   ObjLabel("lbl_stat",x+8, y+258, "Status:",   CLR_GRAY, 8);
-   ObjLabel("val_stat",x+120,y+258, "IDLE",     CLR_GRAY, 8);
-   ObjLabel("lbl_sig", x+8, y+274, "Signal:",   CLR_GRAY, 8);
-   ObjLabel("val_sig", x+120,y+274, "—",        CLR_WHITE, 8);
-   ObjLabel("lbl_pnl", x+8, y+290, "P/L:",      CLR_GRAY, 8);
-   ObjLabel("val_pnl", x+120,y+290, "---",      CLR_WHITE, 8);
-   ObjLabel("lbl_grd", x+8, y+306, "Grid Lvl:", CLR_GRAY, 8);
-   ObjLabel("val_grd", x+120,y+306, "0 / "+IntegerToString(InpGridLevels), CLR_WHITE, 8);
+   ObjLabel("lbl_stat",x+8, y+274, "Status:",   CLR_GRAY, 8);
+   ObjLabel("val_stat",x+120,y+274, "IDLE",     CLR_GRAY, 8);
+   ObjLabel("lbl_sig", x+8, y+290, "Signal:",   CLR_GRAY, 8);
+   ObjLabel("val_sig", x+120,y+290, "—",        CLR_WHITE, 8);
+   ObjLabel("lbl_pnl", x+8, y+306, "P/L:",      CLR_GRAY, 8);
+   ObjLabel("val_pnl", x+120,y+306, "---",      CLR_WHITE, 8);
+   ObjLabel("lbl_grd", x+8, y+322, "Grid Lvl:", CLR_GRAY, 8);
+   ObjLabel("val_grd", x+120,y+322, "0 / "+IntegerToString(InpGridLevels), CLR_WHITE, 8);
 
    // Section: Stats
-   ObjRect("sgstat",  x+1, y+326, w-2, 18, C'22,28,50');
-   ObjLabel("sgstat_t",x+8,y+329, "STATISTICS", CLR_GRAY, 7);
+   ObjRect("sgstat",  x+1, y+342, w-2, 18, C'22,28,50');
+   ObjLabel("sgstat_t",x+8,y+345, "STATISTICS", CLR_GRAY, 7);
 
-   ObjLabel("lbl_tot",x+8, y+349, "Trades:",   CLR_GRAY, 8);
-   ObjLabel("val_tot",x+120,y+349, "0",        CLR_WHITE, 8);
-   ObjLabel("lbl_wr", x+8, y+349, "",          CLR_GRAY, 8);
-   ObjLabel("val_wr", x+148,y+349, "WR: --",   CLR_WHITE, 8);
+   ObjLabel("lbl_tot",x+8, y+365, "Trades:",   CLR_GRAY, 8);
+   ObjLabel("val_tot",x+120,y+365, "0",        CLR_WHITE, 8);
+   ObjLabel("lbl_wr", x+8, y+365, "",          CLR_GRAY, 8);
+   ObjLabel("val_wr", x+148,y+365, "WR: --",   CLR_WHITE, 8);
 
    ChartRedraw(0);
 }
@@ -677,9 +739,20 @@ void UpdatePanel()
    UpdateLabel("val_ma",  IntegerToString(InpMAFast)+"/"+IntegerToString(InpMASlow)+
                "  EMA "+IntegerToString(InpEMAFast)+"/"+IntegerToString(InpEMASlow), CLR_WHITE);
    UpdateLabel("val_rsi", "P="+IntegerToString(GetRSIPeriod())+
-               " OB="+DoubleToString(InpRSIOB,0)+" OS="+DoubleToString(InpRSIOS,0), CLR_WHITE);
+               " B:"+DoubleToString(InpRSIMinBuy,0)+"-"+DoubleToString(InpRSIOB,0)+
+               " S:"+DoubleToString(InpRSIOS,0)+"-"+DoubleToString(InpRSIMaxSell,0), CLR_WHITE);
    UpdateLabel("val_lot", DoubleToString(CalcLot(),2)+" (auto="+
                (InpAutoLot?"YES":"NO")+")",                                   CLR_WHITE);
+
+   string slMode;
+   if(!InpUseSL)
+      slMode = "DISABLED";
+   else if(botTF == PERIOD_M1)
+      slMode = "ATR×"+DoubleToString(InpSLATRMult,1)+" (adaptive)";
+   else
+      slMode = "FIXED "+DoubleToString(InpSLFixedPts,0)+"pts";
+   UpdateLabel("val_slm", slMode, InpUseSL ? CLR_ORANGE : CLR_RED);
+
    // Trade status
    UpdateLabel("val_stat", botStatus, statusClr);
    UpdateLabel("val_sig",  lastSignal, CLR_WHITE);
@@ -741,6 +814,7 @@ void OnDeinit(const int reason)
    IndicatorRelease(hEMAFast);
    IndicatorRelease(hEMASlow);
    IndicatorRelease(hRSI);
+   IndicatorRelease(hATR);
    DestroyPanel();
 }
 
