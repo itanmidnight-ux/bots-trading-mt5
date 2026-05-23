@@ -4,8 +4,8 @@
 //|      Metals (XAUUSD, XPTUSD) + Forex — MT5                     |
 //+------------------------------------------------------------------+
 #property copyright "ScalpMaster Pro"
-#property version   "3.00"
-#property description "GMMA/SAR/ADX/Pivot intelligent scalper — M1 & M15"
+#property version   "3.10"
+#property description "GMMA/SAR/ADX/Pivot intelligent scalper — M1 & M15 | v3.1 smart lot scaling"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -79,9 +79,10 @@ input  double          InpADXExitLevel   = 28.0;       // ADX level to watch for
 
 sinput string          _S5_ = "─────── RISK MANAGEMENT ───────";
 input  bool            InpAutoLot        = true;       // Auto Lot by Balance
-input  double          InpLotPer100      = 0.01;       // Lot per $100 balance
-input  double          InpMinLot         = 0.01;       // Min Lot
-input  double          InpMaxLot         = 5.0;        // Max Lot
+input  double          InpScaleBase      = 15.0;       // Balance ($) where lot scaling starts (<base → 0.01)
+input  double          InpScaleStep      = 20.0;       // USD balance per +0.01 lot increment
+input  double          InpMinLot         = 0.01;       // Min / Fixed Lot (when AutoLot=false)
+input  double          InpMaxLot         = 5.0;        // Max Lot cap (safety)
 input  bool            InpUseSL          = true;       // Enable Stop Loss
 input  double          InpPivotSLBuffer  = 3.0;        // Buffer pips beyond Pivot level
 input  double          InpSLHardCapPips  = 50.0;       // Hard cap SL distance (pips)
@@ -208,10 +209,14 @@ string TFName(ENUM_BOT_TF tf)
 //+------------------------------------------------------------------+
 double CalcLot()
 {
-   if(!InpAutoLot) return NormLot(InpLotPer100);
+   if(!InpAutoLot) return NormLot(InpMinLot);
    double balance = AcctInfo.Balance();
    if(balance <= 0) return InpMinLot;
-   double lot = MathFloor(balance / 100.0) * InpLotPer100;
+   double lot;
+   if(balance < InpScaleBase)
+      lot = 0.01;                                              // below threshold → minimum lot
+   else
+      lot = 0.02 + MathFloor((balance - InpScaleBase) / InpScaleStep) * 0.01;  // 0.02 at $15, +0.01 per $20
    lot = MathMax(InpMinLot, MathMin(InpMaxLot, lot));
    return NormLot(lot);
 }
@@ -477,6 +482,40 @@ bool GMMALongExpanding(bool buy)
    double spread1 = MathAbs(ema30[1] - ema60[1]);
    double spread2 = MathAbs(ema30[2] - ema60[2]);
    return spread1 >= spread2 * 0.95;  // expanding or stable (5% tolerance)
+}
+
+// GMMA group average comparison — short-group avg vs long-group avg.
+// Responds immediately at trend start (used for M1 entry, no cross-count delay).
+bool GMMATrendingBuy()
+{
+   if(!InpUseGMMA) return true;
+   double shortAvg = 0, longAvg = 0;
+   for(int i = 0; i < 6; i++)
+   {
+      double sb[], lb[];
+      ArraySetAsSeries(sb, true); ArraySetAsSeries(lb, true);
+      if(CopyBuffer(hGMMAShort[i], 0, 0, 2, sb) < 2) return true;
+      if(CopyBuffer(hGMMALong[i],  0, 0, 2, lb) < 2) return true;
+      shortAvg += sb[1];
+      longAvg  += lb[1];
+   }
+   return shortAvg > longAvg;
+}
+
+bool GMMATrendingSell()
+{
+   if(!InpUseGMMA) return true;
+   double shortAvg = 0, longAvg = 0;
+   for(int i = 0; i < 6; i++)
+   {
+      double sb[], lb[];
+      ArraySetAsSeries(sb, true); ArraySetAsSeries(lb, true);
+      if(CopyBuffer(hGMMAShort[i], 0, 0, 2, sb) < 2) return true;
+      if(CopyBuffer(hGMMALong[i],  0, 0, 2, lb) < 2) return true;
+      shortAvg += sb[1];
+      longAvg  += lb[1];
+   }
+   return shortAvg < longAvg;
 }
 
 //+------------------------------------------------------------------+
@@ -872,7 +911,7 @@ void ProcessBar(int bar)
             // M1: EMA confirmation is mandatory (max 5-bar wait)
             // M15: enter 2 bars after MA cross (EMA adjusts TP timing only)
             bool m1RequireEMA = (botTF == PERIOD_M1);
-            int  emaMaxWait   = 5;
+            int  emaMaxWait   = (botTF == PERIOD_M1) ? 8 : 5;  // M1 gets extra bars (EMA and SMA cross close together)
 
             if(m1RequireEMA && bar > maCrossBar + emaMaxWait)
             {
@@ -889,17 +928,24 @@ void ProcessBar(int bar)
 
             if(readyToEnter)
             {
-               bool rsiOk  = maDir ? RSIOKBuy()           : RSIOKSell();
-               bool macdOk = maDir ? MACDOKBuy()          : MACDOKSell();
-               bool sarOk  = maDir ? SARDirectionBuy()    : SARDirectionSell();
-               bool gmmaOk = maDir ? GMMAHalfCrossedBuy() : GMMAHalfCrossedSell();
+               bool rsiOk  = maDir ? RSIOKBuy()  : RSIOKSell();
+               bool macdOk = maDir ? MACDOKBuy() : MACDOKSell();
+               bool sarOk  = maDir ? SARDirectionBuy()  : SARDirectionSell();
+               // M1 scalper: use GMMA group average comparison — responds at trend start.
+               // M15 grid: use cross-count (≥3 long EMAs crossed = stronger confirmation).
+               bool gmmaOk = maDir
+                  ? (botTF==PERIOD_M1 ? GMMATrendingBuy()  : GMMAHalfCrossedBuy())
+                  : (botTF==PERIOD_M1 ? GMMATrendingSell() : GMMAHalfCrossedSell());
                bool adxOk  = ADXStrong();
                bool volOk  = VolumeOK();
                if(!rsiOk || !macdOk || !sarOk || !gmmaOk || !adxOk || !volOk)
                {
-                  Print("Entry blocked — RSI:", rsiOk, " MACD:", macdOk, " SAR:", sarOk,
-                        " GMMA:", gmmaOk, " ADX:", adxOk, " Vol:", volOk, ". Reset.");
-                  botState = STATE_IDLE;
+                  Print("Entry blocked @ bar ", bar, " — RSI:", rsiOk, " MACD:", macdOk,
+                        " SAR:", sarOk, " GMMA:", gmmaOk, " ADX:", adxOk, " Vol:", volOk);
+                  // M1: give 2 extra bars after EMA cross to align filters before resetting.
+                  // M15: reset immediately (wider candles give full confirmation per bar).
+                  bool doReset = (botTF == PERIOD_M1) ? (bar > emaCrossBar + 3) : true;
+                  if(doReset) { Print("Entry timeout. Reset to IDLE."); botState = STATE_IDLE; }
                   break;
                }
                bool opened = OpenTrade(maDir);
@@ -1011,7 +1057,7 @@ void CreatePanel()
    ObjRect("bg",     x,   y,   w,   h,   CLR_BG,    CLR_BORDER);
    // Title bar
    ObjRect("hdr",    x+1, y+1, w-2, 28, CLR_HDR,   CLR_BORDER);
-   ObjLabel("title", x+10, y+9, "⚡ ScalpMaster Pro v1.0", CLR_TITLE, 9, "Consolas Bold");
+   ObjLabel("title", x+10, y+9, "⚡ ScalpMaster Pro v3.1", CLR_TITLE, 9, "Consolas Bold");
 
    // Section: Account
    ObjRect("sgacct",  x+1,  y+35, w-2, 18, C'22,28,50');
@@ -1090,8 +1136,10 @@ void UpdatePanel()
    UpdateLabel("val_rsi", "P="+IntegerToString(GetRSIPeriod())+
                " B:"+DoubleToString(InpRSIMinBuy,0)+"-"+DoubleToString(InpRSIOB,0)+
                " S:"+DoubleToString(InpRSIOS,0)+"-"+DoubleToString(InpRSIMaxSell,0), CLR_WHITE);
-   UpdateLabel("val_lot", DoubleToString(CalcLot(),2)+" (auto="+
-               (InpAutoLot?"YES":"NO")+")",                                   CLR_WHITE);
+   string lotInfo = InpAutoLot
+      ? (DoubleToString(CalcLot(),2)+" auto ≥$"+DoubleToString(InpScaleBase,0)+"+$"+DoubleToString(InpScaleStep,0)+"/step")
+      : (DoubleToString(InpMinLot,2)+" fixed");
+   UpdateLabel("val_lot", lotInfo, CLR_WHITE);
 
    string slMode = InpUseSL
       ? "PIVOT S/R ±"+DoubleToString(InpPivotSLBuffer,0)+"pip (cap "+DoubleToString(InpSLHardCapPips,0)+"pip)"
