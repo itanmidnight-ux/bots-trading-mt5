@@ -1,11 +1,11 @@
 //+------------------------------------------------------------------+
-//|                     ScalpMaster Pro v1.0                        |
-//|            MA/EMA/RSI Intelligent Scalper — MT5                 |
-//|      Metals (XAUUSD, XPTUSD) + Forex — Any TF/Leverage         |
+//|                     ScalpMaster Pro v2.0                        |
+//|       M1 Scalper + M15 Grid — MACD/Volume/TF Filtered          |
+//|      Metals (XAUUSD, XPTUSD) + Forex — MT5                     |
 //+------------------------------------------------------------------+
 #property copyright "ScalpMaster Pro"
-#property version   "1.00"
-#property description "Intelligent MA/EMA crossover scalper with dynamic grid TP"
+#property version   "2.00"
+#property description "Professional M1 scalper + M15 grid with MACD, volume and TF filters"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -17,12 +17,8 @@
 //+------------------------------------------------------------------+
 enum ENUM_BOT_TF
 {
-   BTF_M1  = 1,   // 1 Minute
-   BTF_M5  = 5,   // 5 Minutes
-   BTF_M15 = 15,  // 15 Minutes
-   BTF_M30 = 30,  // 30 Minutes
-   BTF_H1  = 60,  // 1 Hour
-   BTF_H4  = 240  // 4 Hours
+   BTF_M1  = 1,   // 1 Minute  (Scalper)
+   BTF_M15 = 15   // 15 Minutes (Grid)
 };
 
 enum ENUM_BOT_STATE
@@ -37,45 +33,58 @@ enum ENUM_BOT_STATE
 //| INPUT PARAMETERS                                                 |
 //+------------------------------------------------------------------+
 sinput string          _S0_ = "─────── TIMEFRAME ───────";
-input  ENUM_BOT_TF     InpTimeframe   = BTF_M5;        // Operating Timeframe
+input  ENUM_BOT_TF     InpTimeframe   = BTF_M1;        // Operating Timeframe
 
 sinput string          _S1_ = "─────── MA SETTINGS ───────";
-input  int             InpMAFast      = 9;             // MA Fast Period
-input  int             InpMASlow      = 26;            // MA Slow Period
+input  int             InpMAFast      = 9;             // MA Fast Period (SMA)
+input  int             InpMASlow      = 26;            // MA Slow Period (SMA)
 
 sinput string          _S2_ = "─────── EMA SETTINGS ───────";
 input  int             InpEMAFast     = 9;             // EMA Fast Period
 input  int             InpEMASlow     = 26;            // EMA Slow Period
 
-sinput string          _S2B_ = "─────── ENTRY CONFIRMATION ───────";
-input  bool            InpEMARequiredM1  = true;        // Require EMA confirm on M1
-input  int             InpEMAMaxWaitBars = 5;           // Max bars to wait for EMA (M1)
-
 sinput string          _S3_ = "─────── RSI SETTINGS ───────";
 input  bool            InpRSIAuto     = true;          // Auto RSI Period by TF
 input  int             InpRSIPeriod   = 14;            // RSI Period (manual)
-input  double          InpRSIOB       = 65.0;          // RSI Overbought (max BUY)
-input  double          InpRSIOS       = 35.0;          // RSI Oversold (min SELL)
+input  double          InpRSIOB       = 65.0;          // RSI Max for BUY
+input  double          InpRSIOS       = 35.0;          // RSI Min for SELL
 input  double          InpRSIMinBuy   = 40.0;          // RSI Minimum for BUY
 input  double          InpRSIMaxSell  = 60.0;          // RSI Maximum for SELL
 
-sinput string          _S4_ = "─────── RISK MANAGEMENT ───────";
+sinput string          _S4_ = "─────── MACD FILTER ───────";
+input  bool            InpUseMACDFilter = true;        // Enable MACD confirmation
+input  int             InpMACDFast      = 12;          // MACD Fast EMA
+input  int             InpMACDSlow      = 26;          // MACD Slow EMA
+input  int             InpMACDSignal    = 9;           // MACD Signal period
+
+sinput string          _S4B_ = "─────── VOLUME FILTER ───────";
+input  bool            InpUseVolFilter  = true;        // Enable volume confirmation
+input  int             InpVolPeriod     = 20;          // Volume MA period
+input  double          InpVolMult       = 1.2;         // Min ratio current/avg volume
+
+sinput string          _S4C_ = "─────── TF TREND FILTER (M1) ───────";
+input  bool            InpUseTFFilter   = true;        // Use M15 trend filter (M1 only)
+
+sinput string          _S5_ = "─────── RISK MANAGEMENT ───────";
 input  bool            InpAutoLot     = true;          // Auto Lot by Balance
 input  double          InpLotPer100   = 0.01;          // Lot per $100 balance
 input  double          InpMinLot      = 0.01;          // Min Lot
 input  double          InpMaxLot      = 5.0;           // Max Lot
-input  bool            InpUseSL       = true;          // Enable Stop Loss on entry
-input  int             InpSLATRPeriod = 14;            // ATR Period (M1 adaptive SL)
-input  double          InpSLATRMult   = 1.5;           // ATR Multiplier (M1 SL)
-input  double          InpSLFixedPts  = 300.0;         // Fixed SL points×10 (M15+)
+input  bool            InpUseSL       = true;          // Enable Stop Loss
+input  double          InpSLProtectUSD = 1.35;         // Max loss per trade (USD)
+input  double          InpSLMinPips    = 5.0;          // Min SL distance (pips, floor)
 
-sinput string          _S5_ = "─────── GRID TP ───────";
+sinput string          _S5B_ = "─────── SCALPER (M1) ───────";
+input  double          InpScalpTPPips    = 5.0;        // Scalper TP in pips (M1)
+input  double          InpScalpMinProfit = 0.10;       // USD to trigger breakeven move
+
+sinput string          _S6_ = "─────── GRID TP (M15) ───────";
 input  double          InpGridPts     = 15.0;          // Grid Step (points ×10)
 input  int             InpGridLevels  = 6;             // Grid Levels
-input  double          InpMinProfit   = 0.10;          // Min USD Profit to Close
+input  double          InpMinProfit   = 0.10;          // Min USD Profit to close
 input  int             InpBuyExtra    = 3;             // Extra Wait Bars (BUY)
 
-sinput string          _S6_ = "─────── PANEL ───────";
+sinput string          _S7_ = "─────── PANEL ───────";
 input  bool            InpShowPanel   = true;          // Show Dashboard
 input  int             InpPanelX      = 15;            // Panel X
 input  int             InpPanelY      = 30;            // Panel Y
@@ -88,7 +97,9 @@ CPositionInfo   PosInfo;
 CAccountInfo    AcctInfo;
 CSymbolInfo     SymInfo;
 
-int    hMAFast, hMASlow, hEMAFast, hEMASlow, hRSI, hATR;
+int    hMAFast, hMASlow, hEMAFast, hEMASlow, hRSI;
+int    hMACD;                  // MACD on botTF
+int    hM15Fast, hM15Slow;    // SMA on M15 for trend filter (M1 mode only)
 
 ENUM_TIMEFRAMES botTF;
 ENUM_BOT_STATE  botState     = STATE_IDLE;
@@ -110,6 +121,7 @@ double          tpGrid[];
 int             gridLevel    = 0;
 double          trailSL      = 0;
 ulong           posTicket    = 0;
+bool            beMoveDone   = false;  // breakeven applied (M1 scalper)
 
 int             statTotal    = 0;
 int             statWins     = 0;
@@ -142,11 +154,7 @@ int GetRSIPeriod()
    switch(botTF)
    {
       case PERIOD_M1:  return 7;
-      case PERIOD_M5:  return 10;
       case PERIOD_M15: return 14;
-      case PERIOD_M30: return 14;
-      case PERIOD_H1:  return 18;
-      case PERIOD_H4:  return 21;
       default:         return 14;
    }
 }
@@ -159,12 +167,8 @@ ENUM_TIMEFRAMES BotTFtoPeriod(ENUM_BOT_TF tf)
    switch(tf)
    {
       case BTF_M1:  return PERIOD_M1;
-      case BTF_M5:  return PERIOD_M5;
       case BTF_M15: return PERIOD_M15;
-      case BTF_M30: return PERIOD_M30;
-      case BTF_H1:  return PERIOD_H1;
-      case BTF_H4:  return PERIOD_H4;
-      default:      return PERIOD_M5;
+      default:      return PERIOD_M1;
    }
 }
 
@@ -172,12 +176,8 @@ string TFName(ENUM_BOT_TF tf)
 {
    switch(tf)
    {
-      case BTF_M1:  return "M1";
-      case BTF_M5:  return "M5";
-      case BTF_M15: return "M15";
-      case BTF_M30: return "M30";
-      case BTF_H1:  return "H1";
-      case BTF_H4:  return "H4";
+      case BTF_M1:  return "M1 (Scalper)";
+      case BTF_M15: return "M15 (Grid)";
       default:      return "??";
    }
 }
@@ -205,33 +205,30 @@ double NormLot(double lot)
 }
 
 //+------------------------------------------------------------------+
-//| STOP LOSS CALCULATION                                            |
+//| STOP LOSS — fixed dollar risk (InpSLProtectUSD per trade)       |
 //+------------------------------------------------------------------+
 double CalcSL(bool buy, double entry)
 {
    if(!InpUseSL) return 0;
-   double pt = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   double slDist;
+   double pt       = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double tickVal  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double lot      = CalcLot();
 
-   if(botTF == PERIOD_M1)
-   {
-      double atrBuf[];
-      ArraySetAsSeries(atrBuf, true);
-      if(CopyBuffer(hATR, 0, 0, 2, atrBuf) < 2)
-         slDist = InpSLFixedPts * pt * 10.0;
-      else
-         slDist = atrBuf[1] * InpSLATRMult;
-   }
-   else
-   {
-      slDist = InpSLFixedPts * pt * 10.0;
-   }
+   // Pip value = monetary value of 1 pip for current lot size
+   double pipSize  = pt * 10.0;  // 1 pip = 10 points (5-digit brokers)
+   double pipValue = (tickSize > 0) ? lot * tickVal * (pipSize / tickSize) : 0;
 
-   // Respect broker's minimum stops level (required by MT5)
-   long stopsLvl = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
-   double minDist = (stopsLvl + 5) * pt;
-   if(slDist < minDist) slDist = minDist;
+   // Pips needed to risk exactly InpSLProtectUSD
+   double slPips = (pipValue > 0) ? InpSLProtectUSD / pipValue : InpSLMinPips;
 
+   // Apply floor: broker minimum stops level + InpSLMinPips user floor
+   long   stopsLvl = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   double brokerMinPips = (double)(stopsLvl / 10 + 2);
+   double minPips = MathMax(InpSLMinPips, brokerMinPips);
+   slPips = MathMax(slPips, minPips);
+
+   double slDist = slPips * pt * 10.0;
    double sl = buy ? entry - slDist : entry + slDist;
    return NormalizeDouble(sl, _Digits);
 }
@@ -246,14 +243,24 @@ bool InitIndicators()
    hEMAFast = iMA(_Symbol, botTF, InpEMAFast, 0, MODE_EMA, PRICE_CLOSE);
    hEMASlow = iMA(_Symbol, botTF, InpEMASlow, 0, MODE_EMA, PRICE_CLOSE);
    hRSI     = iRSI(_Symbol, botTF, GetRSIPeriod(), PRICE_CLOSE);
-   hATR     = iATR(_Symbol, botTF, InpSLATRPeriod);
+   hMACD    = iMACD(_Symbol, botTF, InpMACDFast, InpMACDSlow, InpMACDSignal, PRICE_CLOSE);
+
+   // M15 trend filter handles — only used when running on M1
+   if(botTF == PERIOD_M1 && InpUseTFFilter)
+   {
+      hM15Fast = iMA(_Symbol, PERIOD_M15, InpMAFast, 0, MODE_SMA, PRICE_CLOSE);
+      hM15Slow = iMA(_Symbol, PERIOD_M15, InpMASlow, 0, MODE_SMA, PRICE_CLOSE);
+      if(hM15Fast == INVALID_HANDLE || hM15Slow == INVALID_HANDLE)
+      { Alert("ScalpMaster: Failed to create M15 filter handles!"); return false; }
+   }
+   else { hM15Fast = INVALID_HANDLE; hM15Slow = INVALID_HANDLE; }
 
    if(hMAFast  == INVALID_HANDLE ||
       hMASlow  == INVALID_HANDLE ||
       hEMAFast == INVALID_HANDLE ||
       hEMASlow == INVALID_HANDLE ||
       hRSI     == INVALID_HANDLE ||
-      hATR     == INVALID_HANDLE)
+      hMACD    == INVALID_HANDLE)
    {
       Alert("ScalpMaster: Failed to create indicator handles!");
       return false;
@@ -316,6 +323,69 @@ bool RSIOKBuy()  { double r=GetRSI(1); return r >= InpRSIMinBuy  && r <= InpRSIO
 bool RSIOKSell() { double r=GetRSI(1); return r <= InpRSIMaxSell && r >= InpRSIOS; }
 
 //+------------------------------------------------------------------+
+//| MACD FILTER — histogram must confirm direction                   |
+//+------------------------------------------------------------------+
+bool MACDOKBuy()
+{
+   if(!InpUseMACDFilter) return true;
+   double macd[], signal[];
+   ArraySetAsSeries(macd, true); ArraySetAsSeries(signal, true);
+   if(CopyBuffer(hMACD, 0, 0, 3, macd)   < 3) return true;
+   if(CopyBuffer(hMACD, 1, 0, 3, signal) < 3) return true;
+   return (macd[1] - signal[1]) > 0;
+}
+
+bool MACDOKSell()
+{
+   if(!InpUseMACDFilter) return true;
+   double macd[], signal[];
+   ArraySetAsSeries(macd, true); ArraySetAsSeries(signal, true);
+   if(CopyBuffer(hMACD, 0, 0, 3, macd)   < 3) return true;
+   if(CopyBuffer(hMACD, 1, 0, 3, signal) < 3) return true;
+   return (macd[1] - signal[1]) < 0;
+}
+
+//+------------------------------------------------------------------+
+//| VOLUME FILTER — current volume > average × multiplier           |
+//+------------------------------------------------------------------+
+bool VolumeOK()
+{
+   if(!InpUseVolFilter) return true;
+   long vols[];
+   ArraySetAsSeries(vols, true);
+   int n = InpVolPeriod + 1;
+   if(CopyTickVolume(_Symbol, botTF, 0, n, vols) < n) return true;
+   long cur = vols[1];
+   long sum = 0;
+   for(int i = 1; i <= InpVolPeriod; i++) sum += vols[i];
+   double avg = (double)sum / InpVolPeriod;
+   return cur >= avg * InpVolMult;
+}
+
+//+------------------------------------------------------------------+
+//| M15 TREND FILTER — only active when botTF == M1                 |
+//+------------------------------------------------------------------+
+bool M15TrendOKBuy()
+{
+   if(!InpUseTFFilter || botTF != PERIOD_M1 || hM15Fast == INVALID_HANDLE) return true;
+   double f[], s[];
+   ArraySetAsSeries(f, true); ArraySetAsSeries(s, true);
+   if(CopyBuffer(hM15Fast, 0, 0, 2, f) < 2) return true;
+   if(CopyBuffer(hM15Slow, 0, 0, 2, s) < 2) return true;
+   return f[1] > s[1];
+}
+
+bool M15TrendOKSell()
+{
+   if(!InpUseTFFilter || botTF != PERIOD_M1 || hM15Fast == INVALID_HANDLE) return true;
+   double f[], s[];
+   ArraySetAsSeries(f, true); ArraySetAsSeries(s, true);
+   if(CopyBuffer(hM15Fast, 0, 0, 2, f) < 2) return true;
+   if(CopyBuffer(hM15Slow, 0, 0, 2, s) < 2) return true;
+   return f[1] < s[1];
+}
+
+//+------------------------------------------------------------------+
 //| BUILD GRID LEVELS                                                |
 //+------------------------------------------------------------------+
 void BuildGrid(double entry, bool buy)
@@ -367,9 +437,19 @@ bool OpenTrade(bool buy)
    double bidPrice  = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double openPrice = buy ? askPrice : bidPrice;
    double sl        = CalcSL(buy, openPrice);
+   double pt        = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
 
-   bool ok = buy ? Trade.Buy(lot,  _Symbol, 0, sl, 0, "SMP_BUY")
-                 : Trade.Sell(lot, _Symbol, 0, sl, 0, "SMP_SELL");
+   // M1 scalper: set hard TP in the order; M15 grid manages TP manually
+   double tp = 0;
+   if(botTF == PERIOD_M1)
+   {
+      double tpDist = InpScalpTPPips * pt * 10.0;
+      tp = buy ? openPrice + tpDist : openPrice - tpDist;
+      tp = NormalizeDouble(tp, _Digits);
+   }
+
+   bool ok = buy ? Trade.Buy(lot,  _Symbol, 0, sl, tp, "SMP_BUY")
+                 : Trade.Sell(lot, _Symbol, 0, sl, tp, "SMP_SELL");
    if(!ok)
    { Print("OpenTrade failed: ", GetLastError()); return false; }
 
@@ -383,12 +463,14 @@ bool OpenTrade(bool buy)
                     : SymbolInfoDouble(_Symbol, SYMBOL_BID);
    openLot    = lot;
    isBuy      = buy;
+   beMoveDone = false;
    BuildGrid(entryPrice, buy);
    statTotal++;
    botStatus  = buy ? "LONG OPEN" : "SHORT OPEN";
    statusClr  = buy ? CLR_GREEN : CLR_RED;
    Print("Trade opened: ", buy?"BUY":"SELL", " Lot=", lot,
-         " Entry=", entryPrice, " SL=", DoubleToString(sl, _Digits));
+         " Entry=", entryPrice, " SL=", DoubleToString(sl,_Digits),
+         " TP=", tp > 0 ? DoubleToString(tp,_Digits) : "GRID");
    return true;
 }
 
@@ -404,7 +486,7 @@ bool CloseTrade()
    { Print("CloseTrade failed: ", GetLastError()); return false; }
    statProfit += profit;
    if(profit > 0) statWins++;
-   posTicket  = 0; openLot  = 0; gridLevel = 0; trailSL = 0;
+   posTicket  = 0; openLot  = 0; gridLevel = 0; trailSL = 0; beMoveDone = false;
    botStatus  = "IDLE"; statusClr = CLR_GRAY;
    Print("Trade closed. Profit=", DoubleToString(profit,2));
    return true;
@@ -426,7 +508,53 @@ void UpdateSL(double sl)
 }
 
 //+------------------------------------------------------------------+
-//| MANAGE GRID TP                                                   |
+//| MANAGE SCALPER TP (M1 only)                                     |
+//+------------------------------------------------------------------+
+void ManageScalperTP(int bar)
+{
+   ulong t;
+   if(!FindPosition(t))
+   {
+      // Position was auto-closed by MT5 (TP or SL hit) — recover stats from history
+      if(HistorySelect(TimeCurrent() - 600, TimeCurrent()))
+      {
+         int deals = HistoryDealsTotal();
+         for(int i = deals - 1; i >= 0; i--)
+         {
+            ulong dk = HistoryDealGetTicket(i);
+            if(HistoryDealGetInteger(dk, DEAL_MAGIC)  == MAGIC &&
+               HistoryDealGetInteger(dk, DEAL_ENTRY)  == DEAL_ENTRY_OUT)
+            {
+               double dp = HistoryDealGetDouble(dk, DEAL_PROFIT)
+                         + HistoryDealGetDouble(dk, DEAL_SWAP)
+                         + HistoryDealGetDouble(dk, DEAL_COMMISSION);
+               statProfit += dp;
+               if(dp > 0) statWins++;
+               break;
+            }
+         }
+      }
+      posTicket=0; openLot=0; beMoveDone=false; gridLevel=0; trailSL=0;
+      botStatus="IDLE"; statusClr=CLR_GRAY;
+      botState=STATE_IDLE; emaArrived=false;
+      return;
+   }
+
+   double profit = GetProfit();
+
+   // Once minimum profit reached, move SL to breakeven + small buffer
+   if(!beMoveDone && profit >= InpScalpMinProfit)
+   {
+      double pt  = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+      double beSL = NormalizeDouble(entryPrice + (isBuy ? pt*2 : -pt*2), _Digits);
+      UpdateSL(beSL);
+      beMoveDone = true;
+      Print("Scalper: SL → breakeven. Profit=", DoubleToString(profit,2));
+   }
+}
+
+//+------------------------------------------------------------------+
+//| MANAGE GRID TP (M15 only)                                       |
 //+------------------------------------------------------------------+
 void ManageGridTP(int bar)
 {
@@ -541,17 +669,18 @@ void ProcessBar(int bar)
                Print("EMA cross pre-entry @ bar", emaCrossBar);
             }
 
-            bool m1RequireEMA = (botTF == PERIOD_M1 && InpEMARequiredM1);
+            // M1: EMA confirmation is mandatory (max 5-bar wait)
+            // M15: enter 2 bars after MA cross (EMA adjusts TP timing only)
+            bool m1RequireEMA = (botTF == PERIOD_M1);
+            int  emaMaxWait   = 5;
 
-            // M1 with required EMA: timeout if EMA never arrives
-            if(m1RequireEMA && bar > maCrossBar + InpEMAMaxWaitBars)
+            if(m1RequireEMA && bar > maCrossBar + emaMaxWait)
             {
                Print("M1 EMA wait timeout. Reset to IDLE.");
                botState = STATE_IDLE;
                break;
             }
 
-            // Determine if we should attempt entry this bar
             bool readyToEnter = false;
             if(m1RequireEMA)
                readyToEnter = emaArrived && bar >= emaCrossBar + 1;
@@ -560,10 +689,14 @@ void ProcessBar(int bar)
 
             if(readyToEnter)
             {
-               bool rsiOk = maDir ? RSIOKBuy() : RSIOKSell();
-               if(!rsiOk)
+               bool rsiOk  = maDir ? RSIOKBuy()      : RSIOKSell();
+               bool macdOk = maDir ? MACDOKBuy()     : MACDOKSell();
+               bool tfOk   = maDir ? M15TrendOKBuy() : M15TrendOKSell();
+               bool volOk  = VolumeOK();
+               if(!rsiOk || !macdOk || !tfOk || !volOk)
                {
-                  Print("RSI blocked entry. Reset.");
+                  Print("Entry blocked — RSI:", rsiOk, " MACD:", macdOk,
+                        " TF:", tfOk, " Vol:", volOk, ". Reset.");
                   botState = STATE_IDLE;
                   break;
                }
@@ -607,11 +740,16 @@ void ProcessBar(int bar)
             break;
          }
 
-         //--- In trade: manage grid TP
+         //--- In trade: M1 uses scalper manager, M15 uses grid
          case STATE_IN_TRADE:
          {
-            ManageGridTP(bar);
-            if(!HasPosition()) { botState=STATE_IDLE; emaArrived=false; }
+            if(botTF == PERIOD_M1)
+               ManageScalperTP(bar);
+            else
+               ManageGridTP(bar);
+            // Edge case: position gone but state not reset inside manager
+            if(!HasPosition() && botState == STATE_IN_TRADE)
+            { botState=STATE_IDLE; emaArrived=false; }
             break;
          }
       }
@@ -665,7 +803,7 @@ void CreatePanel()
 {
    if(!InpShowPanel) return;
    int x = InpPanelX, y = InpPanelY;
-   int w = 230, h = 390;
+   int w = 245, h = 408;
 
    // Background
    ObjRect("bg",     x,   y,   w,   h,   CLR_BG,    CLR_BORDER);
@@ -700,30 +838,32 @@ void CreatePanel()
    ObjLabel("val_rsi", x+120,y+198, "---",      CLR_WHITE, 8);
    ObjLabel("lbl_lot", x+8, y+214, "Lot Size:", CLR_GRAY, 8);
    ObjLabel("val_lot", x+120,y+214, "---",      CLR_WHITE, 8);
-   ObjLabel("lbl_slm", x+8, y+230, "SL Mode:",  CLR_GRAY, 8);
-   ObjLabel("val_slm", x+120,y+230, "---",      CLR_WHITE, 8);
+   ObjLabel("lbl_slm", x+8, y+230, "SL Risk:",   CLR_GRAY, 8);
+   ObjLabel("val_slm", x+120,y+230, "---",       CLR_WHITE, 8);
+   ObjLabel("lbl_flt", x+8, y+246, "Filters:",  CLR_GRAY, 8);
+   ObjLabel("val_flt", x+120,y+246, "---",       CLR_WHITE, 8);
 
    // Section: Trade Status
-   ObjRect("sgtrd",   x+1, y+251, w-2, 18, C'22,28,50');
-   ObjLabel("sgtrd_t",x+8, y+254, "TRADE STATUS", CLR_GRAY, 7);
+   ObjRect("sgtrd",   x+1, y+267, w-2, 18, C'22,28,50');
+   ObjLabel("sgtrd_t",x+8, y+270, "TRADE STATUS", CLR_GRAY, 7);
 
-   ObjLabel("lbl_stat",x+8, y+274, "Status:",   CLR_GRAY, 8);
-   ObjLabel("val_stat",x+120,y+274, "IDLE",     CLR_GRAY, 8);
-   ObjLabel("lbl_sig", x+8, y+290, "Signal:",   CLR_GRAY, 8);
-   ObjLabel("val_sig", x+120,y+290, "—",        CLR_WHITE, 8);
-   ObjLabel("lbl_pnl", x+8, y+306, "P/L:",      CLR_GRAY, 8);
-   ObjLabel("val_pnl", x+120,y+306, "---",      CLR_WHITE, 8);
-   ObjLabel("lbl_grd", x+8, y+322, "Grid Lvl:", CLR_GRAY, 8);
-   ObjLabel("val_grd", x+120,y+322, "0 / "+IntegerToString(InpGridLevels), CLR_WHITE, 8);
+   ObjLabel("lbl_stat",x+8, y+290, "Status:",   CLR_GRAY, 8);
+   ObjLabel("val_stat",x+120,y+290, "IDLE",     CLR_GRAY, 8);
+   ObjLabel("lbl_sig", x+8, y+306, "Signal:",   CLR_GRAY, 8);
+   ObjLabel("val_sig", x+120,y+306, "—",        CLR_WHITE, 8);
+   ObjLabel("lbl_pnl", x+8, y+322, "P/L:",      CLR_GRAY, 8);
+   ObjLabel("val_pnl", x+120,y+322, "---",      CLR_WHITE, 8);
+   ObjLabel("lbl_grd", x+8, y+338, "Mode/Lvl:", CLR_GRAY, 8);
+   ObjLabel("val_grd", x+120,y+338, "---",      CLR_WHITE, 8);
 
    // Section: Stats
-   ObjRect("sgstat",  x+1, y+342, w-2, 18, C'22,28,50');
-   ObjLabel("sgstat_t",x+8,y+345, "STATISTICS", CLR_GRAY, 7);
+   ObjRect("sgstat",  x+1, y+358, w-2, 18, C'22,28,50');
+   ObjLabel("sgstat_t",x+8,y+361, "STATISTICS", CLR_GRAY, 7);
 
-   ObjLabel("lbl_tot",x+8, y+365, "Trades:",   CLR_GRAY, 8);
-   ObjLabel("val_tot",x+120,y+365, "0",        CLR_WHITE, 8);
-   ObjLabel("lbl_wr", x+8, y+365, "",          CLR_GRAY, 8);
-   ObjLabel("val_wr", x+148,y+365, "WR: --",   CLR_WHITE, 8);
+   ObjLabel("lbl_tot",x+8, y+381, "Trades:",   CLR_GRAY, 8);
+   ObjLabel("val_tot",x+120,y+381, "0",        CLR_WHITE, 8);
+   ObjLabel("lbl_wr", x+8, y+381, "",          CLR_GRAY, 8);
+   ObjLabel("val_wr", x+148,y+381, "WR: --",   CLR_WHITE, 8);
 
    ChartRedraw(0);
 }
@@ -751,14 +891,20 @@ void UpdatePanel()
    UpdateLabel("val_lot", DoubleToString(CalcLot(),2)+" (auto="+
                (InpAutoLot?"YES":"NO")+")",                                   CLR_WHITE);
 
-   string slMode;
-   if(!InpUseSL)
-      slMode = "DISABLED";
-   else if(botTF == PERIOD_M1)
-      slMode = "ATR×"+DoubleToString(InpSLATRMult,1)+" (adaptive)";
-   else
-      slMode = "FIXED "+DoubleToString(InpSLFixedPts,0)+"pts";
+   string slMode = InpUseSL
+      ? "$"+DoubleToString(InpSLProtectUSD,2)+" risk (min "+DoubleToString(InpSLMinPips,0)+"pip)"
+      : "DISABLED";
    UpdateLabel("val_slm", slMode, InpUseSL ? CLR_ORANGE : CLR_RED);
+
+   // Filter status
+   bool fMacd = botState==STATE_IDLE ? true : (maDir ? MACDOKBuy() : MACDOKSell());
+   bool fVol  = VolumeOK();
+   bool fTF   = botState==STATE_IDLE ? true : (maDir ? M15TrendOKBuy() : M15TrendOKSell());
+   string flt = string(fMacd?"MACD▲ ":"MACD✗ ") +
+                string(fVol ?"VOL▲ " :"VOL✗ ") +
+                string(fTF  ?"TF▲"   :"TF✗");
+   color fltClr = (fMacd && fVol && fTF) ? CLR_GREEN : CLR_YELLOW;
+   UpdateLabel("val_flt", flt, fltClr);
 
    // Trade status
    UpdateLabel("val_stat", botStatus, statusClr);
@@ -767,7 +913,11 @@ void UpdatePanel()
    double pnl    = GetProfit();
    color pnlClr  = pnl > 0 ? CLR_GREEN : (pnl < 0 ? CLR_RED : CLR_GRAY);
    UpdateLabel("val_pnl", DoubleToString(pnl,2)+" "+cur, pnlClr);
-   UpdateLabel("val_grd", IntegerToString(gridLevel)+"/"+IntegerToString(InpGridLevels), CLR_WHITE);
+
+   string modeStr = botTF==PERIOD_M1
+      ? "SCALPER BE="+(beMoveDone?"SET":"WAIT")
+      : "GRID "+IntegerToString(gridLevel)+"/"+IntegerToString(InpGridLevels);
+   UpdateLabel("val_grd", modeStr, CLR_WHITE);
 
    // Stats
    double wr = statTotal > 0 ? (double)statWins/statTotal*100.0 : 0;
@@ -821,7 +971,9 @@ void OnDeinit(const int reason)
    IndicatorRelease(hEMAFast);
    IndicatorRelease(hEMASlow);
    IndicatorRelease(hRSI);
-   IndicatorRelease(hATR);
+   IndicatorRelease(hMACD);
+   if(hM15Fast != INVALID_HANDLE) IndicatorRelease(hM15Fast);
+   if(hM15Slow != INVALID_HANDLE) IndicatorRelease(hM15Slow);
    DestroyPanel();
 }
 
