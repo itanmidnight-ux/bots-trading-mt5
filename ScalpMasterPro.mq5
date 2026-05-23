@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
-//|                     ScalpMaster Pro v3.3                        |
+//|                     ScalpMaster Pro v3.4                        |
 //|  GMMA + SAR + ADX + Pivot Points + H1 SAR/MACD — M1/M15/H1    |
 //|      Metals (XAUUSD, XPTUSD) + Forex — MT5                     |
 //+------------------------------------------------------------------+
 #property copyright "ScalpMaster Pro"
-#property version   "3.30"
+#property version   "3.40"
 #property description "M1 Scalper | M15 Grid | H1 SAR+MACD — multi-TF intelligent bot"
 
 #include <Trade\Trade.mqh>
@@ -799,36 +799,86 @@ bool OpenTrade(bool buy)
 }
 
 //+------------------------------------------------------------------+
-//| CLOSE TRADE                                                      |
+//| CLOSE TRADE — with retry logic and real profit capture          |
 //+------------------------------------------------------------------+
 bool CloseTrade()
 {
    ulong t;
    if(!FindPosition(t)) { openLot=0; posTicket=0; return true; }
-   double profit = GetProfit();
-   if(!Trade.PositionClose(t, 20))
-   { Print("CloseTrade failed: ", GetLastError()); return false; }
-   statProfit += profit;
-   if(profit > 0) statWins++;
-   posTicket  = 0; openLot  = 0; gridLevel = 0; trailSL = 0; beMoveDone = false;
-   botStatus  = "IDLE"; statusClr = CLR_GRAY;
-   Print("Trade closed. Profit=", DoubleToString(profit,2));
+   ulong savedTicket = t;
+
+   bool closed = false;
+   for(int attempt = 1; attempt <= 3 && !closed; attempt++)
+   {
+      int slip = 50 * attempt;   // 50, 100, 150 pts — covers XAUUSD volatility spikes
+      if(Trade.PositionClose(t, slip))
+         closed = true;
+      else
+      {
+         Print("CloseTrade attempt ", attempt, "/3 failed. Err=", GetLastError(),
+               " Slip=", slip, " Ticket=", t);
+         if(attempt < 3) Sleep(300 * attempt);
+      }
+   }
+
+   if(!closed)
+   {
+      Print("CloseTrade FAILED after 3 attempts. Resetting state. Ticket=", t);
+      posTicket=0; openLot=0; gridLevel=0; trailSL=0; beMoveDone=false;
+      botStatus="ERR-CLOSE"; statusClr=CLR_RED;
+      return false;
+   }
+
+   // Capture actual realized profit from deal history (includes spread + commission)
+   double realProfit = GetProfit();
+   if(HistorySelectByPosition(savedTicket))
+   {
+      int deals = HistoryDealsTotal();
+      for(int i = deals - 1; i >= 0; i--)
+      {
+         ulong dk = HistoryDealGetTicket(i);
+         if(HistoryDealGetInteger(dk, DEAL_ENTRY) == DEAL_ENTRY_OUT)
+         {
+            realProfit = HistoryDealGetDouble(dk, DEAL_PROFIT)
+                       + HistoryDealGetDouble(dk, DEAL_SWAP)
+                       + HistoryDealGetDouble(dk, DEAL_COMMISSION);
+            break;
+         }
+      }
+   }
+
+   statProfit += realProfit;
+   if(realProfit > 0) statWins++;
+   posTicket=0; openLot=0; gridLevel=0; trailSL=0; beMoveDone=false;
+   botStatus="IDLE"; statusClr=CLR_GRAY;
+   Print("Trade closed. Profit=", DoubleToString(realProfit,2));
    return true;
 }
 
 //+------------------------------------------------------------------+
-//| UPDATE SL ON POSITION                                            |
+//| UPDATE SL ON POSITION — with broker stop level guard           |
 //+------------------------------------------------------------------+
 void UpdateSL(double sl)
 {
    ulong t;
    if(!FindPosition(t)) return;
    PosInfo.SelectByTicket(t);
-   double curSL = PosInfo.StopLoss();
+   double curSL   = PosInfo.StopLoss();
    sl = NormalizeDouble(sl, _Digits);
-   // Only move SL in favorable direction
-   if(isBuy  && sl > curSL) Trade.PositionModify(t, sl, 0);
-   if(!isBuy && sl < curSL) Trade.PositionModify(t, sl, 0);
+
+   double pt      = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   long   slvl    = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   double minDist = (slvl + 2) * pt;
+   double bid     = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask     = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+   if(isBuy  && (bid - sl) < minDist) return;   // too close to market, skip
+   if(!isBuy && (sl - ask) < minDist) return;
+
+   if(isBuy  && sl > curSL)
+   { if(!Trade.PositionModify(t, sl, 0)) Print("UpdateSL BUY failed: ", GetLastError()); }
+   if(!isBuy && sl < curSL)
+   { if(!Trade.PositionModify(t, sl, 0)) Print("UpdateSL SELL failed: ", GetLastError()); }
 }
 
 //+------------------------------------------------------------------+
@@ -839,15 +889,14 @@ void ManageScalperExit(int bar)
    ulong t;
    if(!FindPosition(t))
    {
-      // Auto-closed by MT5 (TP or SL) — recover stats from deal history
-      if(HistorySelect(TimeCurrent() - 600, TimeCurrent()))
+      // Auto-closed by MT5 (TP or SL hit) — recover actual profit by position ID
+      if(posTicket > 0 && HistorySelectByPosition(posTicket))
       {
          int deals = HistoryDealsTotal();
          for(int i = deals - 1; i >= 0; i--)
          {
             ulong dk = HistoryDealGetTicket(i);
-            if(HistoryDealGetInteger(dk, DEAL_MAGIC) == MAGIC &&
-               HistoryDealGetInteger(dk, DEAL_ENTRY) == DEAL_ENTRY_OUT)
+            if(HistoryDealGetInteger(dk, DEAL_ENTRY) == DEAL_ENTRY_OUT)
             {
                double dp = HistoryDealGetDouble(dk, DEAL_PROFIT)
                          + HistoryDealGetDouble(dk, DEAL_SWAP)
@@ -908,9 +957,9 @@ void ManageScalperExit(int bar)
    int  score = (sarFlip ? 2 : 0) + (int)adxPeak + (int)gmmaCon
               + (int)macdAgainst + (int)rsiTurning;
 
-   // ── EXIT A: SAR flip — close at market, don't wait for SL ────────
-   // Prevents the 30-50 pip Pivot SL from absorbing the full move back.
-   if(sarFlip)
+   // ── EXIT A: SAR flip — close only when not at a loss ─────────────
+   // Prevents giving back gains; Pivot SL guards the downside when in loss.
+   if(sarFlip && profit >= 0)
    {
       Print("Scalper: SAR flip exit. Profit=", DoubleToString(profit,2));
       CloseTrade(); botState=STATE_IDLE; emaArrived=false;
@@ -944,7 +993,30 @@ void ManageScalperExit(int bar)
 //+------------------------------------------------------------------+
 void ManageGridTP(int bar)
 {
-   if(!HasPosition()) return;
+   if(!HasPosition())
+   {
+      // Auto-closed by MT5 (SL or TP hit) — recover actual profit by position ID
+      if(posTicket > 0 && HistorySelectByPosition(posTicket))
+      {
+         int deals = HistoryDealsTotal();
+         for(int i = deals - 1; i >= 0; i--)
+         {
+            ulong dk = HistoryDealGetTicket(i);
+            if(HistoryDealGetInteger(dk, DEAL_ENTRY) == DEAL_ENTRY_OUT)
+            {
+               double dp = HistoryDealGetDouble(dk, DEAL_PROFIT)
+                         + HistoryDealGetDouble(dk, DEAL_SWAP)
+                         + HistoryDealGetDouble(dk, DEAL_COMMISSION);
+               statProfit += dp;
+               if(dp > 0) statWins++;
+               break;
+            }
+         }
+      }
+      posTicket=0; openLot=0; beMoveDone=false; gridLevel=0; trailSL=0;
+      botStatus="IDLE"; statusClr=CLR_GRAY;
+      return;
+   }
 
    double profit   = GetProfit();
 
@@ -1025,15 +1097,14 @@ void ManageH1Exit(int bar)
    ulong t;
    if(!FindPosition(t))
    {
-      // Auto-closed by MT5 — recover stats
-      if(HistorySelect(TimeCurrent() - 7200, TimeCurrent()))
+      // Auto-closed by MT5 (SL/TP) — recover actual profit by position ID
+      if(posTicket > 0 && HistorySelectByPosition(posTicket))
       {
          int deals = HistoryDealsTotal();
          for(int i = deals - 1; i >= 0; i--)
          {
             ulong dk = HistoryDealGetTicket(i);
-            if(HistoryDealGetInteger(dk, DEAL_MAGIC) == MAGIC &&
-               HistoryDealGetInteger(dk, DEAL_ENTRY) == DEAL_ENTRY_OUT)
+            if(HistoryDealGetInteger(dk, DEAL_ENTRY) == DEAL_ENTRY_OUT)
             {
                double dp = HistoryDealGetDouble(dk, DEAL_PROFIT)
                          + HistoryDealGetDouble(dk, DEAL_SWAP)
@@ -1081,8 +1152,8 @@ void ManageH1Exit(int bar)
       }
    }
 
-   // ── EXIT A: H1 SAR flipped against position ───────────────────────
-   if(SARH1FlippedAgainst())
+   // ── EXIT A: H1 SAR flipped — close only when not at a loss ───────
+   if(SARH1FlippedAgainst() && profit >= 0)
    {
       Print("H1: SAR flip exit. Profit=", DoubleToString(profit,2));
       CloseTrade(); botState=STATE_IDLE; emaArrived=false;
