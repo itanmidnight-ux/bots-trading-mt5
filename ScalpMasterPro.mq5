@@ -4,8 +4,8 @@
 //|      Metals (XAUUSD, XPTUSD) + Forex — MT5                     |
 //+------------------------------------------------------------------+
 #property copyright "ScalpMaster Pro"
-#property version   "3.10"
-#property description "GMMA/SAR/ADX/Pivot intelligent scalper — M1 & M15 | v3.1 smart lot scaling"
+#property version   "3.20"
+#property description "GMMA/SAR/ADX/Pivot intelligent scalper — M1 & M15 | v3.2 max-profit trailing exit"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -88,7 +88,7 @@ input  double          InpPivotSLBuffer  = 3.0;        // Buffer pips beyond Piv
 input  double          InpSLHardCapPips  = 50.0;       // Hard cap SL distance (pips)
 
 sinput string          _S5B_ = "─────── SCALPER (M1) ───────";
-input  double          InpScalpTPPips    = 5.0;        // Scalper TP in pips (M1)
+input  double          InpScalpTPPips    = 0.0;        // Safety TP pips M1 — 0=off (indicators manage exit)
 input  double          InpScalpMinProfit = 0.10;       // USD to trigger breakeven move
 
 sinput string          _S6_ = "─────── GRID TP (M15) ───────";
@@ -398,6 +398,17 @@ bool IsNewBar()
 bool RSIOKBuy()  { double r=GetRSI(1); return r >= InpRSIMinBuy  && r <= InpRSIOB; }
 bool RSIOKSell() { double r=GetRSI(1); return r <= InpRSIMaxSell && r >= InpRSIOS; }
 
+// RSI reached an extreme and is turning back → trend peak (exit signal when in trade)
+bool RSITurningAgainst()
+{
+   if(!HasPosition()) return false;
+   double r1 = GetRSI(1);   // last confirmed bar
+   double r2 = GetRSI(2);   // two bars ago
+   if(isBuy  && r2 >= 68.0 && r1 < r2) return true;   // was overbought, now falling
+   if(!isBuy && r2 <= 32.0 && r1 > r2) return true;   // was oversold, now rising
+   return false;
+}
+
 //+------------------------------------------------------------------+
 //| MACD FILTER — histogram must confirm direction                   |
 //+------------------------------------------------------------------+
@@ -636,9 +647,9 @@ bool OpenTrade(bool buy)
    double sl        = CalcSL(buy, openPrice);
    double pt        = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
 
-   // M1 scalper: set hard TP in the order; M15 grid manages TP manually
+   // M1: hard TP only if InpScalpTPPips > 0 (safety net); 0 = indicators manage exit
    double tp = 0;
-   if(botTF == PERIOD_M1)
+   if(botTF == PERIOD_M1 && InpScalpTPPips > 0)
    {
       double tpDist = InpScalpTPPips * pt * 10.0;
       tp = buy ? openPrice + tpDist : openPrice - tpDist;
@@ -705,7 +716,7 @@ void UpdateSL(double sl)
 }
 
 //+------------------------------------------------------------------+
-//| MANAGE SCALPER EXIT (M1) — SAR flip, ADX peak, GMMA convergence|
+//| MANAGE SCALPER EXIT (M1) — trailing SL + multi-signal peak exit|
 //+------------------------------------------------------------------+
 void ManageScalperExit(int bar)
 {
@@ -738,41 +749,78 @@ void ManageScalperExit(int bar)
    }
 
    double profit = GetProfit();
+   double pt     = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
 
-   // EXIT 1: SAR giró contra nuestra posición → cierre si no hay pérdida
-   if(SARFlippedAgainst() && profit >= 0)
+   // ── PHASE 1: Breakeven — lock entry once minimum profit reached ───
+   if(!beMoveDone && profit >= InpScalpMinProfit)
+   {
+      double beSL = NormalizeDouble(entryPrice + (isBuy ? pt*2 : -pt*2), _Digits);
+      UpdateSL(beSL);
+      beMoveDone = true;
+      Print("Scalper: BE locked. Profit=", DoubleToString(profit,2));
+   }
+
+   // ── PHASE 2: SAR trailing SL — grows with the trend ──────────────
+   // After breakeven, trail the SL to the SAR level so gains compound
+   // as long as the trend continues.  SAR naturally rises in bull trends.
+   if(beMoveDone)
+   {
+      double sarBuf[];
+      ArraySetAsSeries(sarBuf, true);
+      if(CopyBuffer(hSAR, 0, 0, 2, sarBuf) >= 2)
+      {
+         long   slvl    = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+         double minDist = (slvl + 2) * pt;
+         double sar     = sarBuf[1];
+         double bid     = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         double ask     = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+         if(isBuy  && sar > entryPrice && sar < bid - minDist)
+            UpdateSL(NormalizeDouble(sar, _Digits));
+         if(!isBuy && sar < entryPrice && sar > ask + minDist)
+            UpdateSL(NormalizeDouble(sar, _Digits));
+      }
+   }
+
+   // ── REVERSAL SCORING ─────────────────────────────────────────────
+   // SAR weighted ×2: single most reliable M1 reversal signal.
+   // Other indicators weighted ×1 each — consensus exits at peak.
+   bool sarFlip     = SARFlippedAgainst();
+   bool adxPeak     = ADXExhausting();
+   bool gmmaCon     = !GMMALongExpanding(isBuy);
+   bool macdAgainst = isBuy ? !MACDOKBuy() : !MACDOKSell();
+   bool rsiTurning  = RSITurningAgainst();
+   int  score = (sarFlip ? 2 : 0) + (int)adxPeak + (int)gmmaCon
+              + (int)macdAgainst + (int)rsiTurning;
+
+   // ── EXIT A: SAR flip — close at market, don't wait for SL ────────
+   // Prevents the 30-50 pip Pivot SL from absorbing the full move back.
+   if(sarFlip)
    {
       Print("Scalper: SAR flip exit. Profit=", DoubleToString(profit,2));
       CloseTrade(); botState=STATE_IDLE; emaArrived=false;
       return;
    }
 
-   // EXIT 2: ADX alcanzó su pico y cae → cierre en máximo momentum
-   if(ADXExhausting() && profit > InpScalpMinProfit)
+   // ── EXIT B: Peak consensus (score ≥ 3) — close at max momentum ───
+   // 3 pts = any combination: ADX+GMMA+MACD, ADX+GMMA+RSI, etc.
+   if(score >= 3 && profit >= InpScalpMinProfit)
    {
-      Print("Scalper: ADX exhaustion exit. Profit=", DoubleToString(profit,2));
+      Print("Scalper: Peak exit score=", score, " ADX=", adxPeak,
+            " GMMA=", gmmaCon, " MACD=", macdAgainst, " RSI=", rsiTurning,
+            ". Profit=", DoubleToString(profit,2));
       CloseTrade(); botState=STATE_IDLE; emaArrived=false;
       return;
    }
 
-   // EXIT 3: GMMA grupo largo converge → el mercado se retrae, cerrar con lo ganado
-   if(!GMMALongExpanding(isBuy) && profit > 0)
+   // ── EXIT C: 2 signals + meaningful profit locked in ───────────────
+   if(score >= 2 && profit >= InpScalpMinProfit * 2)
    {
-      Print("Scalper: GMMA long converging. Profit=", DoubleToString(profit,2));
+      Print("Scalper: 2-signal exit score=", score,
+            ". Profit=", DoubleToString(profit,2));
       CloseTrade(); botState=STATE_IDLE; emaArrived=false;
       return;
    }
-
-   // BREAKEVEN: mover SL a breakeven+buffer cuando se alcanza el umbral mínimo
-   if(!beMoveDone && profit >= InpScalpMinProfit)
-   {
-      double pt   = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-      double beSL = NormalizeDouble(entryPrice + (isBuy ? pt*2 : -pt*2), _Digits);
-      UpdateSL(beSL);
-      beMoveDone = true;
-      Print("Scalper: SL → breakeven. Profit=", DoubleToString(profit,2));
-   }
-   // TP safety net: si ninguna señal cierra, el TP en la orden cierra automáticamente
+   // SAR trailing SL handles the rest; InpScalpTPPips (if >0) is hard safety net
 }
 
 //+------------------------------------------------------------------+
@@ -784,16 +832,17 @@ void ManageGridTP(int bar)
 
    double profit   = GetProfit();
 
-   // INTELLIGENT EXIT M15: SAR flipped against + at least 1 grid level + profit > 0
-   if(SARFlippedAgainst() && gridLevel >= 1 && profit > 0)
+   // INTELLIGENT EXIT M15: SAR flipped + ≥2 grid levels captured + profit > 0
+   // Requires 2 levels before firing to let the grid develop (avoids early exits)
+   if(SARFlippedAgainst() && gridLevel >= 2 && profit > 0)
    {
       Print("Grid: SAR flip exit @ level ", gridLevel, ". Profit=", DoubleToString(profit,2));
       CloseTrade(); botState=STATE_IDLE; emaArrived=false;
       return;
    }
 
-   // INTELLIGENT EXIT M15: ADX peak + at least 1 level + profit >= minimum
-   if(ADXExhausting() && gridLevel >= 1 && profit >= InpMinProfit)
+   // INTELLIGENT EXIT M15: ADX peak + ≥2 levels + profit >= minimum
+   if(ADXExhausting() && gridLevel >= 2 && profit >= InpMinProfit)
    {
       Print("Grid: ADX exhaustion exit @ level ", gridLevel, ". Profit=", DoubleToString(profit,2));
       CloseTrade(); botState=STATE_IDLE; emaArrived=false;
@@ -1057,7 +1106,7 @@ void CreatePanel()
    ObjRect("bg",     x,   y,   w,   h,   CLR_BG,    CLR_BORDER);
    // Title bar
    ObjRect("hdr",    x+1, y+1, w-2, 28, CLR_HDR,   CLR_BORDER);
-   ObjLabel("title", x+10, y+9, "⚡ ScalpMaster Pro v3.1", CLR_TITLE, 9, "Consolas Bold");
+   ObjLabel("title", x+10, y+9, "⚡ ScalpMaster Pro v3.2", CLR_TITLE, 9, "Consolas Bold");
 
    // Section: Account
    ObjRect("sgacct",  x+1,  y+35, w-2, 18, C'22,28,50');
@@ -1167,7 +1216,7 @@ void UpdatePanel()
    UpdateLabel("val_pnl", DoubleToString(pnl,2)+" "+cur, pnlClr);
 
    string modeStr = botTF==PERIOD_M1
-      ? "SCALPER BE="+(beMoveDone?"SET":"WAIT")
+      ? "SCALP Trail="+(beMoveDone?"SAR":"WAIT BE")
       : "GRID "+IntegerToString(gridLevel)+"/"+IntegerToString(InpGridLevels);
    UpdateLabel("val_grd", modeStr, CLR_WHITE);
 
