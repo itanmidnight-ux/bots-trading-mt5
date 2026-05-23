@@ -227,7 +227,13 @@ double CalcSL(bool buy, double entry)
       slDist = InpSLFixedPts * pt * 10.0;
    }
 
-   return buy ? entry - slDist : entry + slDist;
+   // Respect broker's minimum stops level (required by MT5)
+   long stopsLvl = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   double minDist = (stopsLvl + 5) * pt;
+   if(slDist < minDist) slDist = minDist;
+
+   double sl = buy ? entry - slDist : entry + slDist;
+   return NormalizeDouble(sl, _Digits);
 }
 
 //+------------------------------------------------------------------+
@@ -413,6 +419,7 @@ void UpdateSL(double sl)
    if(!FindPosition(t)) return;
    PosInfo.SelectByTicket(t);
    double curSL = PosInfo.StopLoss();
+   sl = NormalizeDouble(sl, _Digits);
    // Only move SL in favorable direction
    if(isBuy  && sl > curSL) Trade.PositionModify(t, sl, 0);
    if(!isBuy && sl < curSL) Trade.PositionModify(t, sl, 0);
