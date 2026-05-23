@@ -1,11 +1,11 @@
 //+------------------------------------------------------------------+
-//|                     ScalpMaster Pro v2.0                        |
-//|       M1 Scalper + M15 Grid — MACD/Volume/TF Filtered          |
+//|                     ScalpMaster Pro v3.0                        |
+//|  GMMA + SAR + ADX + Pivot Points — M1 Scalper / M15 Grid       |
 //|      Metals (XAUUSD, XPTUSD) + Forex — MT5                     |
 //+------------------------------------------------------------------+
 #property copyright "ScalpMaster Pro"
-#property version   "2.00"
-#property description "Professional M1 scalper + M15 grid with MACD, volume and TF filters"
+#property version   "3.00"
+#property description "GMMA/SAR/ADX/Pivot intelligent scalper — M1 & M15"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -62,17 +62,29 @@ input  bool            InpUseVolFilter  = true;        // Enable volume confirma
 input  int             InpVolPeriod     = 20;          // Volume MA period
 input  double          InpVolMult       = 1.2;         // Min ratio current/avg volume
 
-sinput string          _S4C_ = "─────── TF TREND FILTER (M1) ───────";
-input  bool            InpUseTFFilter   = true;        // Use M15 trend filter (M1 only)
+sinput string          _SGMMA_ = "─────── GMMA FILTER ───────";
+input  bool            InpUseGMMA        = true;       // Enable GMMA validation
+input  int             InpGMMACrossCount = 3;          // Min long EMAs crossed by short (1-6)
+
+sinput string          _SSAR_ = "─────── SAR PARABÓLICO ───────";
+input  bool            InpUseSAR         = true;       // Enable SAR direction filter
+input  double          InpSARStep        = 0.02;       // SAR Step
+input  double          InpSARMax         = 0.2;        // SAR Maximum
+
+sinput string          _SADX_ = "─────── ADX FUERZA TENDENCIA ───────";
+input  bool            InpUseADXFilter   = true;       // ADX entry filter (trend exists)
+input  int             InpADXPeriod      = 14;         // ADX Period
+input  double          InpADXMinLevel    = 20.0;       // Min ADX to enter (>20 = trend)
+input  double          InpADXExitLevel   = 28.0;       // ADX level to watch for peak exit
 
 sinput string          _S5_ = "─────── RISK MANAGEMENT ───────";
-input  bool            InpAutoLot     = true;          // Auto Lot by Balance
-input  double          InpLotPer100   = 0.01;          // Lot per $100 balance
-input  double          InpMinLot      = 0.01;          // Min Lot
-input  double          InpMaxLot      = 5.0;           // Max Lot
-input  bool            InpUseSL       = true;          // Enable Stop Loss
-input  double          InpSLProtectUSD = 1.35;         // Max loss per trade (USD)
-input  double          InpSLMinPips    = 5.0;          // Min SL distance (pips, floor)
+input  bool            InpAutoLot        = true;       // Auto Lot by Balance
+input  double          InpLotPer100      = 0.01;       // Lot per $100 balance
+input  double          InpMinLot         = 0.01;       // Min Lot
+input  double          InpMaxLot         = 5.0;        // Max Lot
+input  bool            InpUseSL          = true;       // Enable Stop Loss
+input  double          InpPivotSLBuffer  = 3.0;        // Buffer pips beyond Pivot level
+input  double          InpSLHardCapPips  = 50.0;       // Hard cap SL distance (pips)
 
 sinput string          _S5B_ = "─────── SCALPER (M1) ───────";
 input  double          InpScalpTPPips    = 5.0;        // Scalper TP in pips (M1)
@@ -99,7 +111,16 @@ CSymbolInfo     SymInfo;
 
 int    hMAFast, hMASlow, hEMAFast, hEMASlow, hRSI;
 int    hMACD;                  // MACD on botTF
-int    hM15Fast, hM15Slow;    // SMA on M15 for trend filter (M1 mode only)
+int    hSAR;                   // Parabolic SAR
+int    hADX;                   // ADX (trend strength)
+int    hGMMAShort[6];          // GMMA short group EMAs: 3,5,8,10,12,15
+int    hGMMALong[6];           // GMMA long  group EMAs: 30,35,40,45,50,60
+// hM15Fast/hM15Slow kept as INVALID_HANDLE (replaced by SAR)
+int    hM15Fast = INVALID_HANDLE, hM15Slow = INVALID_HANDLE;
+
+// Standard Guppy Multiple Moving Average periods (not configurable — industry standard)
+const int GMMA_SHORT[6] = {3, 5, 8, 10, 12, 15};
+const int GMMA_LONG[6]  = {30, 35, 40, 45, 50, 60};
 
 ENUM_TIMEFRAMES botTF;
 ENUM_BOT_STATE  botState     = STATE_IDLE;
@@ -205,31 +226,73 @@ double NormLot(double lot)
 }
 
 //+------------------------------------------------------------------+
-//| STOP LOSS — fixed dollar risk (InpSLProtectUSD per trade)       |
+//| PIVOT POINTS — standard pivot from previous D1 candle           |
+//+------------------------------------------------------------------+
+struct PivotLevels { double P, R1, R2, S1, S2; bool valid; };
+
+PivotLevels GetDailyPivots()
+{
+   PivotLevels pv;
+   pv.valid = false;
+   MqlRates daily[];
+   ArraySetAsSeries(daily, true);
+   if(CopyRates(_Symbol, PERIOD_D1, 1, 1, daily) < 1) return pv;
+   double H = daily[0].high;
+   double L = daily[0].low;
+   double C = daily[0].close;
+   pv.P  = (H + L + C) / 3.0;
+   pv.R1 = 2*pv.P - L;
+   pv.S1 = 2*pv.P - H;
+   pv.R2 = pv.P + (H - L);
+   pv.S2 = pv.P - (H - L);
+   pv.valid = true;
+   return pv;
+}
+
+//+------------------------------------------------------------------+
+//| STOP LOSS — Pivot Point based (S1/S2 for BUY, R1/R2 for SELL)  |
 //+------------------------------------------------------------------+
 double CalcSL(bool buy, double entry)
 {
    if(!InpUseSL) return 0;
-   double pt       = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   double tickVal  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-   double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-   double lot      = CalcLot();
+   double pt        = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double pip       = pt * 10.0;
+   double bufDist   = InpPivotSLBuffer * pip;
+   double capDist   = InpSLHardCapPips * pip;
+   long   stopsLvl  = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   double brokerMin = (stopsLvl + 2) * pt;
 
-   // Pip value = monetary value of 1 pip for current lot size
-   double pipSize  = pt * 10.0;  // 1 pip = 10 points (5-digit brokers)
-   double pipValue = (tickSize > 0) ? lot * tickVal * (pipSize / tickSize) : 0;
+   double sl = 0;
+   PivotLevels pv = GetDailyPivots();
 
-   // Pips needed to risk exactly InpSLProtectUSD
-   double slPips = (pipValue > 0) ? InpSLProtectUSD / pipValue : InpSLMinPips;
+   if(pv.valid)
+   {
+      if(buy)
+      {
+         double slS1 = pv.S1 - bufDist;
+         double slS2 = pv.S2 - bufDist;
+         // Use S1 if it gives enough distance; otherwise S2; otherwise broker min
+         if(entry - slS1 >= brokerMin) sl = slS1;
+         else if(entry - slS2 >= brokerMin) sl = slS2;
+         else sl = entry - brokerMin - bufDist;
+         sl = MathMax(sl, entry - capDist);  // hard cap
+      }
+      else
+      {
+         double slR1 = pv.R1 + bufDist;
+         double slR2 = pv.R2 + bufDist;
+         if(slR1 - entry >= brokerMin) sl = slR1;
+         else if(slR2 - entry >= brokerMin) sl = slR2;
+         else sl = entry + brokerMin + bufDist;
+         sl = MathMin(sl, entry + capDist);  // hard cap
+      }
+   }
+   else
+   {
+      // Fallback: broker minimum + buffer
+      sl = buy ? entry - capDist : entry + capDist;
+   }
 
-   // Apply floor: broker minimum stops level + InpSLMinPips user floor
-   long   stopsLvl = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
-   double brokerMinPips = (double)(stopsLvl / 10 + 2);
-   double minPips = MathMax(InpSLMinPips, brokerMinPips);
-   slPips = MathMax(slPips, minPips);
-
-   double slDist = slPips * pt * 10.0;
-   double sl = buy ? entry - slDist : entry + slDist;
    return NormalizeDouble(sl, _Digits);
 }
 
@@ -238,31 +301,39 @@ double CalcSL(bool buy, double entry)
 //+------------------------------------------------------------------+
 bool InitIndicators()
 {
-   hMAFast  = iMA(_Symbol, botTF, InpMAFast,  0, MODE_SMA, PRICE_CLOSE);
-   hMASlow  = iMA(_Symbol, botTF, InpMASlow,  0, MODE_SMA, PRICE_CLOSE);
-   hEMAFast = iMA(_Symbol, botTF, InpEMAFast, 0, MODE_EMA, PRICE_CLOSE);
-   hEMASlow = iMA(_Symbol, botTF, InpEMASlow, 0, MODE_EMA, PRICE_CLOSE);
-   hRSI     = iRSI(_Symbol, botTF, GetRSIPeriod(), PRICE_CLOSE);
+   // Core MA / EMA / RSI / MACD
+   hMAFast  = iMA  (_Symbol, botTF, InpMAFast,  0, MODE_SMA, PRICE_CLOSE);
+   hMASlow  = iMA  (_Symbol, botTF, InpMASlow,  0, MODE_SMA, PRICE_CLOSE);
+   hEMAFast = iMA  (_Symbol, botTF, InpEMAFast, 0, MODE_EMA, PRICE_CLOSE);
+   hEMASlow = iMA  (_Symbol, botTF, InpEMASlow, 0, MODE_EMA, PRICE_CLOSE);
+   hRSI     = iRSI (_Symbol, botTF, GetRSIPeriod(), PRICE_CLOSE);
    hMACD    = iMACD(_Symbol, botTF, InpMACDFast, InpMACDSlow, InpMACDSignal, PRICE_CLOSE);
 
-   // M15 trend filter handles — only used when running on M1
-   if(botTF == PERIOD_M1 && InpUseTFFilter)
-   {
-      hM15Fast = iMA(_Symbol, PERIOD_M15, InpMAFast, 0, MODE_SMA, PRICE_CLOSE);
-      hM15Slow = iMA(_Symbol, PERIOD_M15, InpMASlow, 0, MODE_SMA, PRICE_CLOSE);
-      if(hM15Fast == INVALID_HANDLE || hM15Slow == INVALID_HANDLE)
-      { Alert("ScalpMaster: Failed to create M15 filter handles!"); return false; }
-   }
-   else { hM15Fast = INVALID_HANDLE; hM15Slow = INVALID_HANDLE; }
+   // SAR — adapts automatically to botTF
+   hSAR = iSAR(_Symbol, botTF, InpSARStep, InpSARMax);
 
-   if(hMAFast  == INVALID_HANDLE ||
-      hMASlow  == INVALID_HANDLE ||
-      hEMAFast == INVALID_HANDLE ||
-      hEMASlow == INVALID_HANDLE ||
-      hRSI     == INVALID_HANDLE ||
-      hMACD    == INVALID_HANDLE)
+   // ADX
+   hADX = iADX(_Symbol, botTF, InpADXPeriod);
+
+   // GMMA — 12 EMA handles (6 short group + 6 long group)
+   for(int i = 0; i < 6; i++)
    {
-      Alert("ScalpMaster: Failed to create indicator handles!");
+      hGMMAShort[i] = iMA(_Symbol, botTF, GMMA_SHORT[i], 0, MODE_EMA, PRICE_CLOSE);
+      hGMMALong[i]  = iMA(_Symbol, botTF, GMMA_LONG[i],  0, MODE_EMA, PRICE_CLOSE);
+      if(hGMMAShort[i] == INVALID_HANDLE || hGMMALong[i] == INVALID_HANDLE)
+      { Alert("ScalpMaster: GMMA handle failed for index ", i); return false; }
+   }
+
+   // hM15Fast/hM15Slow are no longer used (replaced by SAR)
+   hM15Fast = INVALID_HANDLE;
+   hM15Slow = INVALID_HANDLE;
+
+   if(hMAFast == INVALID_HANDLE || hMASlow  == INVALID_HANDLE ||
+      hEMAFast== INVALID_HANDLE || hEMASlow == INVALID_HANDLE ||
+      hRSI    == INVALID_HANDLE || hMACD    == INVALID_HANDLE ||
+      hSAR    == INVALID_HANDLE || hADX     == INVALID_HANDLE)
+   {
+      Alert("ScalpMaster: Critical indicator handle creation failed!");
       return false;
    }
    return true;
@@ -363,26 +434,113 @@ bool VolumeOK()
 }
 
 //+------------------------------------------------------------------+
-//| M15 TREND FILTER — only active when botTF == M1                 |
+//| GMMA — Guppy Multiple Moving Average filters                    |
 //+------------------------------------------------------------------+
-bool M15TrendOKBuy()
+// Returns how many long-group EMAs have been crossed by EMA15 (short group slowest)
+int GMMACrossCount(bool buy)
 {
-   if(!InpUseTFFilter || botTF != PERIOD_M1 || hM15Fast == INVALID_HANDLE) return true;
-   double f[], s[];
-   ArraySetAsSeries(f, true); ArraySetAsSeries(s, true);
-   if(CopyBuffer(hM15Fast, 0, 0, 2, f) < 2) return true;
-   if(CopyBuffer(hM15Slow, 0, 0, 2, s) < 2) return true;
-   return f[1] > s[1];
+   double ema15buf[];
+   ArraySetAsSeries(ema15buf, true);
+   if(CopyBuffer(hGMMAShort[5], 0, 0, 2, ema15buf) < 2) return 0;
+   double ema15 = ema15buf[1];  // confirmed bar
+   int count = 0;
+   for(int i = 0; i < 6; i++)
+   {
+      double lb[];
+      ArraySetAsSeries(lb, true);
+      if(CopyBuffer(hGMMALong[i], 0, 0, 2, lb) < 2) continue;
+      if(buy  && ema15 > lb[1]) count++;
+      if(!buy && ema15 < lb[1]) count++;
+   }
+   return count;
 }
 
-bool M15TrendOKSell()
+bool GMMAHalfCrossedBuy()
 {
-   if(!InpUseTFFilter || botTF != PERIOD_M1 || hM15Fast == INVALID_HANDLE) return true;
-   double f[], s[];
-   ArraySetAsSeries(f, true); ArraySetAsSeries(s, true);
-   if(CopyBuffer(hM15Fast, 0, 0, 2, f) < 2) return true;
-   if(CopyBuffer(hM15Slow, 0, 0, 2, s) < 2) return true;
-   return f[1] < s[1];
+   if(!InpUseGMMA) return true;
+   return GMMACrossCount(true) >= InpGMMACrossCount;
+}
+
+bool GMMAHalfCrossedSell()
+{
+   if(!InpUseGMMA) return true;
+   return GMMACrossCount(false) >= InpGMMACrossCount;
+}
+
+// Returns true if GMMA long group is still expanding (trend valid, not retracting)
+bool GMMALongExpanding(bool buy)
+{
+   double ema30[], ema60[];
+   ArraySetAsSeries(ema30, true); ArraySetAsSeries(ema60, true);
+   if(CopyBuffer(hGMMALong[0], 0, 0, 3, ema30) < 3) return true;  // EMA30 = index 0
+   if(CopyBuffer(hGMMALong[5], 0, 0, 3, ema60) < 3) return true;  // EMA60 = index 5
+   double spread1 = MathAbs(ema30[1] - ema60[1]);
+   double spread2 = MathAbs(ema30[2] - ema60[2]);
+   return spread1 >= spread2 * 0.95;  // expanding or stable (5% tolerance)
+}
+
+//+------------------------------------------------------------------+
+//| SAR PARABÓLICO — direction + flip detection                     |
+//+------------------------------------------------------------------+
+bool SARDirectionBuy()
+{
+   if(!InpUseSAR) return true;
+   double sarBuf[]; MqlRates bars[];
+   ArraySetAsSeries(sarBuf, true); ArraySetAsSeries(bars, true);
+   if(CopyBuffer(hSAR, 0, 0, 2, sarBuf) < 2) return true;
+   if(CopyRates(_Symbol, botTF, 0, 2, bars) < 2) return true;
+   return sarBuf[1] < bars[1].close;  // SAR below close = bullish
+}
+
+bool SARDirectionSell()
+{
+   if(!InpUseSAR) return true;
+   double sarBuf[]; MqlRates bars[];
+   ArraySetAsSeries(sarBuf, true); ArraySetAsSeries(bars, true);
+   if(CopyBuffer(hSAR, 0, 0, 2, sarBuf) < 2) return true;
+   if(CopyRates(_Symbol, botTF, 0, 2, bars) < 2) return true;
+   return sarBuf[1] > bars[1].close;  // SAR above close = bearish
+}
+
+// Returns true if SAR just flipped AGAINST our open position
+bool SARFlippedAgainst()
+{
+   if(!InpUseSAR || !HasPosition()) return false;
+   double sarBuf[]; MqlRates bars[];
+   ArraySetAsSeries(sarBuf, true); ArraySetAsSeries(bars, true);
+   if(CopyBuffer(hSAR, 0, 0, 3, sarBuf) < 3) return false;
+   if(CopyRates(_Symbol, botTF, 0, 3, bars) < 3) return false;
+   bool prevBullish = sarBuf[2] < bars[2].close;
+   bool currBearish = sarBuf[1] > bars[1].close;
+   bool prevBearish = sarBuf[2] > bars[2].close;
+   bool currBullish = sarBuf[1] < bars[1].close;
+   if(isBuy  && prevBullish && currBearish) return true;
+   if(!isBuy && prevBearish && currBullish) return true;
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| ADX — Fuerza de Tendencia (entry + exhaustion exit)             |
+//+------------------------------------------------------------------+
+bool ADXStrong()
+{
+   if(!InpUseADXFilter) return true;
+   double adxBuf[];
+   ArraySetAsSeries(adxBuf, true);
+   if(CopyBuffer(hADX, 0, 0, 2, adxBuf) < 2) return true;
+   return adxBuf[1] >= InpADXMinLevel;
+}
+
+// Returns true when ADX just peaked (was rising, now falling from high level)
+bool ADXExhausting()
+{
+   double adxBuf[];
+   ArraySetAsSeries(adxBuf, true);
+   if(CopyBuffer(hADX, 0, 0, 4, adxBuf) < 4) return false;
+   bool wasRising  = adxBuf[2] > adxBuf[3];
+   bool nowFalling = adxBuf[1] < adxBuf[2];
+   bool wasHigh    = adxBuf[2] >= InpADXExitLevel;
+   return wasRising && nowFalling && wasHigh;
 }
 
 //+------------------------------------------------------------------+
@@ -508,22 +666,22 @@ void UpdateSL(double sl)
 }
 
 //+------------------------------------------------------------------+
-//| MANAGE SCALPER TP (M1 only)                                     |
+//| MANAGE SCALPER EXIT (M1) — SAR flip, ADX peak, GMMA convergence|
 //+------------------------------------------------------------------+
-void ManageScalperTP(int bar)
+void ManageScalperExit(int bar)
 {
    ulong t;
    if(!FindPosition(t))
    {
-      // Position was auto-closed by MT5 (TP or SL hit) — recover stats from history
+      // Auto-closed by MT5 (TP or SL) — recover stats from deal history
       if(HistorySelect(TimeCurrent() - 600, TimeCurrent()))
       {
          int deals = HistoryDealsTotal();
          for(int i = deals - 1; i >= 0; i--)
          {
             ulong dk = HistoryDealGetTicket(i);
-            if(HistoryDealGetInteger(dk, DEAL_MAGIC)  == MAGIC &&
-               HistoryDealGetInteger(dk, DEAL_ENTRY)  == DEAL_ENTRY_OUT)
+            if(HistoryDealGetInteger(dk, DEAL_MAGIC) == MAGIC &&
+               HistoryDealGetInteger(dk, DEAL_ENTRY) == DEAL_ENTRY_OUT)
             {
                double dp = HistoryDealGetDouble(dk, DEAL_PROFIT)
                          + HistoryDealGetDouble(dk, DEAL_SWAP)
@@ -542,25 +700,67 @@ void ManageScalperTP(int bar)
 
    double profit = GetProfit();
 
-   // Once minimum profit reached, move SL to breakeven + small buffer
+   // EXIT 1: SAR giró contra nuestra posición → cierre si no hay pérdida
+   if(SARFlippedAgainst() && profit >= 0)
+   {
+      Print("Scalper: SAR flip exit. Profit=", DoubleToString(profit,2));
+      CloseTrade(); botState=STATE_IDLE; emaArrived=false;
+      return;
+   }
+
+   // EXIT 2: ADX alcanzó su pico y cae → cierre en máximo momentum
+   if(ADXExhausting() && profit > InpScalpMinProfit)
+   {
+      Print("Scalper: ADX exhaustion exit. Profit=", DoubleToString(profit,2));
+      CloseTrade(); botState=STATE_IDLE; emaArrived=false;
+      return;
+   }
+
+   // EXIT 3: GMMA grupo largo converge → el mercado se retrae, cerrar con lo ganado
+   if(!GMMALongExpanding(isBuy) && profit > 0)
+   {
+      Print("Scalper: GMMA long converging. Profit=", DoubleToString(profit,2));
+      CloseTrade(); botState=STATE_IDLE; emaArrived=false;
+      return;
+   }
+
+   // BREAKEVEN: mover SL a breakeven+buffer cuando se alcanza el umbral mínimo
    if(!beMoveDone && profit >= InpScalpMinProfit)
    {
-      double pt  = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+      double pt   = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
       double beSL = NormalizeDouble(entryPrice + (isBuy ? pt*2 : -pt*2), _Digits);
       UpdateSL(beSL);
       beMoveDone = true;
       Print("Scalper: SL → breakeven. Profit=", DoubleToString(profit,2));
    }
+   // TP safety net: si ninguna señal cierra, el TP en la orden cierra automáticamente
 }
 
 //+------------------------------------------------------------------+
-//| MANAGE GRID TP (M15 only)                                       |
+//| MANAGE GRID TP (M15) — with SAR/ADX intelligent exits          |
 //+------------------------------------------------------------------+
 void ManageGridTP(int bar)
 {
    if(!HasPosition()) return;
 
    double profit   = GetProfit();
+
+   // INTELLIGENT EXIT M15: SAR flipped against + at least 1 grid level + profit > 0
+   if(SARFlippedAgainst() && gridLevel >= 1 && profit > 0)
+   {
+      Print("Grid: SAR flip exit @ level ", gridLevel, ". Profit=", DoubleToString(profit,2));
+      CloseTrade(); botState=STATE_IDLE; emaArrived=false;
+      return;
+   }
+
+   // INTELLIGENT EXIT M15: ADX peak + at least 1 level + profit >= minimum
+   if(ADXExhausting() && gridLevel >= 1 && profit >= InpMinProfit)
+   {
+      Print("Grid: ADX exhaustion exit @ level ", gridLevel, ". Profit=", DoubleToString(profit,2));
+      CloseTrade(); botState=STATE_IDLE; emaArrived=false;
+      return;
+   }
+
    double bid      = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double ask      = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double curPrice = isBuy ? bid : ask;
@@ -689,14 +889,16 @@ void ProcessBar(int bar)
 
             if(readyToEnter)
             {
-               bool rsiOk  = maDir ? RSIOKBuy()      : RSIOKSell();
-               bool macdOk = maDir ? MACDOKBuy()     : MACDOKSell();
-               bool tfOk   = maDir ? M15TrendOKBuy() : M15TrendOKSell();
+               bool rsiOk  = maDir ? RSIOKBuy()           : RSIOKSell();
+               bool macdOk = maDir ? MACDOKBuy()          : MACDOKSell();
+               bool sarOk  = maDir ? SARDirectionBuy()    : SARDirectionSell();
+               bool gmmaOk = maDir ? GMMAHalfCrossedBuy() : GMMAHalfCrossedSell();
+               bool adxOk  = ADXStrong();
                bool volOk  = VolumeOK();
-               if(!rsiOk || !macdOk || !tfOk || !volOk)
+               if(!rsiOk || !macdOk || !sarOk || !gmmaOk || !adxOk || !volOk)
                {
-                  Print("Entry blocked — RSI:", rsiOk, " MACD:", macdOk,
-                        " TF:", tfOk, " Vol:", volOk, ". Reset.");
+                  Print("Entry blocked — RSI:", rsiOk, " MACD:", macdOk, " SAR:", sarOk,
+                        " GMMA:", gmmaOk, " ADX:", adxOk, " Vol:", volOk, ". Reset.");
                   botState = STATE_IDLE;
                   break;
                }
@@ -740,11 +942,11 @@ void ProcessBar(int bar)
             break;
          }
 
-         //--- In trade: M1 uses scalper manager, M15 uses grid
+         //--- In trade: M1 scalper exits (SAR/ADX/GMMA), M15 grid TP
          case STATE_IN_TRADE:
          {
             if(botTF == PERIOD_M1)
-               ManageScalperTP(bar);
+               ManageScalperExit(bar);
             else
                ManageGridTP(bar);
             // Edge case: position gone but state not reset inside manager
@@ -892,18 +1094,20 @@ void UpdatePanel()
                (InpAutoLot?"YES":"NO")+")",                                   CLR_WHITE);
 
    string slMode = InpUseSL
-      ? "$"+DoubleToString(InpSLProtectUSD,2)+" risk (min "+DoubleToString(InpSLMinPips,0)+"pip)"
+      ? "PIVOT S/R ±"+DoubleToString(InpPivotSLBuffer,0)+"pip (cap "+DoubleToString(InpSLHardCapPips,0)+"pip)"
       : "DISABLED";
    UpdateLabel("val_slm", slMode, InpUseSL ? CLR_ORANGE : CLR_RED);
 
-   // Filter status
-   bool fMacd = botState==STATE_IDLE ? true : (maDir ? MACDOKBuy() : MACDOKSell());
+   // Filter status — real-time indicator states
+   bool fSar  = botState==STATE_IDLE ? true : (isBuy ? SARDirectionBuy()    : SARDirectionSell());
+   bool fGmma = botState==STATE_IDLE ? true : (isBuy ? GMMAHalfCrossedBuy() : GMMAHalfCrossedSell());
+   bool fAdx  = ADXStrong();
    bool fVol  = VolumeOK();
-   bool fTF   = botState==STATE_IDLE ? true : (maDir ? M15TrendOKBuy() : M15TrendOKSell());
-   string flt = string(fMacd?"MACD▲ ":"MACD✗ ") +
-                string(fVol ?"VOL▲ " :"VOL✗ ") +
-                string(fTF  ?"TF▲"   :"TF✗");
-   color fltClr = (fMacd && fVol && fTF) ? CLR_GREEN : CLR_YELLOW;
+   string flt = string(fSar ?"SAR▲ ":"SAR✗ ") +
+                string(fGmma?"GMP▲ ":"GMP✗ ") +
+                string(fAdx ?"ADX▲ ":"ADX✗ ") +
+                string(fVol ?"VOL▲" :"VOL✗");
+   color fltClr = (fSar && fGmma && fAdx && fVol) ? CLR_GREEN : CLR_YELLOW;
    UpdateLabel("val_flt", flt, fltClr);
 
    // Trade status
@@ -972,8 +1176,14 @@ void OnDeinit(const int reason)
    IndicatorRelease(hEMASlow);
    IndicatorRelease(hRSI);
    IndicatorRelease(hMACD);
-   if(hM15Fast != INVALID_HANDLE) IndicatorRelease(hM15Fast);
-   if(hM15Slow != INVALID_HANDLE) IndicatorRelease(hM15Slow);
+   if(hSAR != INVALID_HANDLE) IndicatorRelease(hSAR);
+   if(hADX != INVALID_HANDLE) IndicatorRelease(hADX);
+   for(int i = 0; i < 6; i++)
+   {
+      if(hGMMAShort[i] != INVALID_HANDLE) IndicatorRelease(hGMMAShort[i]);
+      if(hGMMALong[i]  != INVALID_HANDLE) IndicatorRelease(hGMMALong[i]);
+   }
+   // hM15Fast/hM15Slow are INVALID_HANDLE — no release needed
    DestroyPanel();
 }
 
