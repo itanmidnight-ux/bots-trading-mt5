@@ -74,7 +74,7 @@ input bool        InpUseFridayFilter = true;  // No new trades after Friday 18:0
 input group "═══════ MA CROSSOVER SETTINGS ═══════"
 input int    InpMAFastPeriod  = 7;        // MA Fast Period
 input int    InpMASlowPeriod  = 21;       // MA Slow Period
-input int    InpMAMethod      = MODE_SMA; // MA Method (SMA/EMA)
+input ENUM_MA_METHOD InpMAMethod = MODE_SMA; // MA Method (SMA/EMA)
 
 //--- SuperTrend Confirmation
 input group "═══════ SUPERTREND CONFIRMATION ═══════"
@@ -448,7 +448,7 @@ bool InitIndicators()
    entryTF = BotTFtoPeriod(InpEntryTF);
    structureTF = BotTFtoPeriod(InpStructureTF);
 
-   // MA Crossover
+   // MA Crossover - FIXED: use ENUM_MA_METHOD directly
    hMAFast = iMA(_Symbol, entryTF, InpMAFastPeriod, 0, InpMAMethod, PRICE_CLOSE);
    hMASlow = iMA(_Symbol, entryTF, InpMASlowPeriod, 0, InpMAMethod, PRICE_CLOSE);
 
