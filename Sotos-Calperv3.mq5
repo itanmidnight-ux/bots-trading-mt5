@@ -1,11 +1,11 @@
 //+------------------------------------------------------------------+
 //|                                              Sotos-Calper.mq5    |
-//|                        RSI Ultra-Short Scalping Bot  v2.21 FINAL  |
+//|                        RSI Ultra-Short Scalping Bot  v2.2 FINAL  |
 //|                                     Timeframe: M1 | Any Market  |
 //+------------------------------------------------------------------+
 #property copyright   "Sotos-Calper"
-#property version     "2.21"
-#property description "RSI Ultra-Short Scalping - M1 | Fixed RSI extremes TP"
+#property version     "2.20"
+#property description "RSI Ultra-Short Scalping - M1"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -80,7 +80,6 @@ input int    inp_MinBarsBetweenTrades= 3;      // Anti-overtrading cooldown (0=d
 input int    inp_WarmupBars          = 50;
 input bool   inp_DebugLog            = false;
 input ulong  inp_Magic               = 202501;
-input bool   inp_CloseAtRSIExtremes  = true;   // Fixed TP: BUY closes at RSI_Sell, SELL closes at RSI_Buy
 
 //+------------------------------------------------------------------+
 //|  GLOBALS                                                         |
@@ -217,13 +216,12 @@ int OnInit() {
 
    g_cachedEquity = g_account.Equity();
 
-   PrintFormat("Sotos-Calper v2.21 | %s | Mode:%s | MACD:%s | ZZ:%s | ATR_SL:%s | ExtremeTP:%s | Lot:%.2f",
+   PrintFormat("Sotos-Calper v2.2 | %s | Mode:%s | MACD:%s | ZZ:%s | ATR_SL:%s | Lot:%.2f",
                _Symbol,
                inp_UseMACross    ? "MACross" : "Default",
                inp_UseMACDFilter ? "ON"      : "OFF",
                inp_UseZigZag     ? "ON"      : "OFF",
                inp_UseATR_SL     ? "ON"      : "OFF",
-               inp_CloseAtRSIExtremes ? "ON" : "OFF",
                inp_LotSize);
    return INIT_SUCCEEDED;
 }
@@ -281,24 +279,6 @@ void CountBuySell(int &nBuy, int &nSell) {
 }
 
 //+------------------------------------------------------------------+
-//|  HELPER: Calculate already-reached RSI TP level                  |
-//|  Used when positions are restored/opened so no reached TP is lost |
-//+------------------------------------------------------------------+
-int ReachedTPLevel(int dir, double rsiLive) {
-   int level = 0;
-   if(dir == -1) {
-      for(int t = 0; t < 5; t++) {
-         if(rsiLive < g_tpSell[t]) level = t + 1; else break;
-      }
-   } else if(dir == 1) {
-      for(int t = 0; t < 5; t++) {
-         if(rsiLive > g_tpBuy[t]) level = t + 1; else break;
-      }
-   }
-   return level;
-}
-
-//+------------------------------------------------------------------+
 //|  HELPER: Sync tracking array (blocked during RunTPSystem)        |
 //+------------------------------------------------------------------+
 void SyncPositionArray() {
@@ -316,37 +296,14 @@ void SyncPositionArray() {
 //+------------------------------------------------------------------+
 //|  HELPER: Register position — duplicate-safe                      |
 //+------------------------------------------------------------------+
-void RegisterPosition(ulong ticket, int dir, double rsiLive) {
-   for(int i = 0; i < ArraySize(g_pos); i++) {
-      if(g_pos[i].ticket == ticket) {
-         int reached = ReachedTPLevel(dir, rsiLive);
-         g_pos[i].dir = dir;
-         if(reached > g_pos[i].tpLevel) g_pos[i].tpLevel = reached;
-         return;
-      }
-   }
+void RegisterPosition(ulong ticket, int dir) {
+   for(int i = 0; i < ArraySize(g_pos); i++)
+      if(g_pos[i].ticket == ticket) return;
    int sz = ArraySize(g_pos);
    ArrayResize(g_pos, sz+1);
    g_pos[sz].ticket  = ticket;
    g_pos[sz].dir     = dir;
-   g_pos[sz].tpLevel = ReachedTPLevel(dir, rsiLive);
-}
-
-//+------------------------------------------------------------------+
-//|  HELPER: Ensure every EA position is tracked by real position ID |
-//|  This protects TP closing after restarts and broker ticket changes|
-//+------------------------------------------------------------------+
-void EnsureTrackedPositions(double rsiLive) {
-   SyncPositionArray();
-   for(int i = PositionsTotal()-1; i >= 0; i--) {
-      ulong tk = PositionGetTicket(i);
-      if(tk == 0) continue;
-      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
-      if((ulong)PositionGetInteger(POSITION_MAGIC) != inp_Magic) continue;
-      ENUM_POSITION_TYPE pt = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-      int dir = (pt == POSITION_TYPE_BUY) ? 1 : (pt == POSITION_TYPE_SELL ? -1 : 0);
-      if(dir != 0) RegisterPosition(tk, dir, rsiLive);
-   }
+   g_pos[sz].tpLevel = 0;
 }
 
 //+------------------------------------------------------------------+
@@ -490,12 +447,10 @@ void OpenTrades(int dir, int count, int totalBars) {
       bool ok = (dir==1) ? g_trade.Buy(inp_LotSize, _Symbol, 0, sl, 0.0, "Sotos-Calper")
                          : g_trade.Sell(inp_LotSize, _Symbol, 0, sl, 0.0, "Sotos-Calper");
       if(ok) {
-         double rsiNow[];
-         if(SafeCopy(g_rsiH, 0, 2, rsiNow))
-            EnsureTrackedPositions(rsiNow[0]);
+         RegisterPosition(g_trade.ResultOrder(), dir);
          g_lastTradeBars = totalBars;   // Record bar of last open for cooldown
-         PrintFormat("Sotos-Calper | %s | Order:%llu | Deal:%llu | Fill:%.5f | Lot:%.2f | SL:%.5f",
-                     dir==1?"BUY":"SELL", g_trade.ResultOrder(), g_trade.ResultDeal(),
+         PrintFormat("Sotos-Calper | %s | Tk:%llu | Fill:%.5f | Lot:%.2f | SL:%.5f",
+                     dir==1?"BUY":"SELL", g_trade.ResultOrder(),
                      g_trade.ResultPrice(), inp_LotSize, sl);
       } else {
          PrintFormat("Sotos-Calper | OPEN FAILED | %s | Err:%d | Ret:%u",
@@ -509,38 +464,18 @@ void OpenTrades(int dir, int count, int totalBars) {
 //|  SELL: strict < advance | >= close   BUY: strict > advance | <=  |
 //+------------------------------------------------------------------+
 void RunTPSystem(double rsiLive) {
-   EnsureTrackedPositions(rsiLive);
    g_inTP = true;
    for(int i = 0; i < ArraySize(g_pos); i++) {
       if(!PositionSelectByTicket(g_pos[i].ticket)) continue;
       int  dir   = g_pos[i].dir;
-      int &level = g_pos[i].tpLevel;
-      double profit = PositionGetDouble(POSITION_PROFIT);
-
-      // Fixed extreme TP requested: if momentum reaches the opposite RSI edge,
-      // close immediately instead of waiting for a rebound that can give back profit.
-      if(inp_CloseAtRSIExtremes) {
-         if(dir == -1 && rsiLive <= inp_RSI_Buy) {
-            PrintFormat("Sotos-Calper | SELL FIXED EXTREME TP | RSI:%.2f Target:%.1f Tk:%llu Profit:%.2f",
-                        rsiLive, inp_RSI_Buy, g_pos[i].ticket, profit);
-            g_trade.PositionClose(g_pos[i].ticket);
-            continue;
-         }
-         if(dir == 1 && rsiLive >= inp_RSI_Sell) {
-            PrintFormat("Sotos-Calper | BUY  FIXED EXTREME TP | RSI:%.2f Target:%.1f Tk:%llu Profit:%.2f",
-                        rsiLive, inp_RSI_Sell, g_pos[i].ticket, profit);
-            g_trade.PositionClose(g_pos[i].ticket);
-            continue;
-         }
-      }
-
+      int level = g_pos[i].tpLevel;
       if(dir == -1) {
          for(int t = level; t < 5; t++) {
             if(rsiLive < g_tpSell[t]) level = t + 1; else break;
          }
          if(level > 0 && rsiLive >= g_tpSell[level-1]) {
-            PrintFormat("Sotos-Calper | SELL TP | RSI:%.2f Ref:%.1f Tk:%llu Profit:%.2f",
-                        rsiLive, g_tpSell[level-1], g_pos[i].ticket, profit);
+            PrintFormat("Sotos-Calper | SELL TP | RSI:%.2f Ref:%.1f Tk:%llu",
+                        rsiLive, g_tpSell[level-1], g_pos[i].ticket);
             g_trade.PositionClose(g_pos[i].ticket);
          }
       } else if(dir == 1) {
@@ -548,8 +483,8 @@ void RunTPSystem(double rsiLive) {
             if(rsiLive > g_tpBuy[t]) level = t + 1; else break;
          }
          if(level > 0 && rsiLive <= g_tpBuy[level-1]) {
-            PrintFormat("Sotos-Calper | BUY  TP | RSI:%.2f Ref:%.1f Tk:%llu Profit:%.2f",
-                        rsiLive, g_tpBuy[level-1], g_pos[i].ticket, profit);
+            PrintFormat("Sotos-Calper | BUY  TP | RSI:%.2f Ref:%.1f Tk:%llu",
+                        rsiLive, g_tpBuy[level-1], g_pos[i].ticket);
             g_trade.PositionClose(g_pos[i].ticket);
          }
       }
@@ -670,5 +605,5 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
 }
 
 //+------------------------------------------------------------------+
-//|  END — SOTOS-CALPER v2.21 FINAL                                   |
+//|  END — SOTOS-CALPER v2.2 FINAL                                   |
 //+------------------------------------------------------------------+
